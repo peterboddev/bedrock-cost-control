@@ -12,6 +12,12 @@ deny policy once a quota is exceeded, and get automatically restored by the
 scheduled daily reset — with no manual or periodic triggering anywhere in
 the enforcement path.
 
+> **This is a reference implementation / sample code**, provided as-is
+> under the [MIT License](./LICENSE) to demonstrate a working approach to
+> per-team Bedrock token-quota enforcement. It is not an officially
+> supported AWS product. Review it against your own security, cost, and
+> data-governance requirements before running it in a production account.
+
 > This project was built using [Kiro's](https://kiro.dev) spec-driven
 > workflow (requirements → design → tasks). The generated spec documents
 > aren't included in this repository; the sections below summarize the
@@ -38,11 +44,11 @@ the enforcement path.
    00:00 UTC, restoring access automatically.
 
 See `infra/stack.ts` for the full architecture and per-Lambda IAM/data-flow
-comments, and `src/*.ts` for the domain logic (each module documents which
-requirement/correctness-property it satisfies in its header comment). The
-test suite (`src/*.test.ts`) implements 23 property-based tests covering
-aggregation correctness, per-model deny-policy isolation, retry/failure
-handling, and audit fidelity.
+comments, and `src/*.ts` for the domain logic (each module documents the
+correctness property it satisfies in its header comment). The test suite
+(`src/*.test.ts`) includes property-based tests covering aggregation
+correctness, per-model deny-policy isolation, retry/failure handling, and
+audit fidelity.
 
 ## Prerequisites
 
@@ -80,10 +86,9 @@ npm run infra:check     # typecheck infra/stack.ts and infra/bin/app.ts
 npm test                # run the full Jest suite (unit + property-based tests)
 ```
 
-The test suite includes 23 property-based tests (via `fast-check`), each
-run against 100+ randomized inputs, covering aggregation correctness,
-per-model deny-policy isolation, retry/failure handling, and audit
-fidelity.
+The test suite includes property-based tests (via `fast-check`), each run
+against 100+ randomized inputs, covering aggregation correctness, per-model
+deny-policy isolation, retry/failure handling, and audit fidelity.
 
 ## Deploying
 
@@ -117,6 +122,41 @@ By default, DynamoDB tables use `RemovalPolicy.DESTROY` (convenient for a
 sandbox — tearing down the stack removes the tables). If this becomes a
 persistent environment, pass `tableRemovalPolicy: RemovalPolicy.RETAIN` via
 stack props in `infra/bin/app.ts` before deploying to production.
+
+### Costs
+
+This stack creates billable resources. There is no fixed monthly fee, but
+you will incur usage-based charges — the main drivers are:
+
+- **S3 storage for Model Invocation Logging.** Every Bedrock call under a
+  tracked role writes its full request/response to S3. On high-traffic
+  accounts this is the largest cost and grows with traffic and prompt
+  size; the 90-day lifecycle rule caps how long it accumulates.
+- **DynamoDB** (on-demand): reads/writes for counters, dedup, quota
+  config, blocked-state, and audit entries, plus DynamoDB Streams.
+- **Lambda** invocations for the collector, enforcer, reset, and
+  reconciliation functions.
+- **SNS** notifications, and standard S3/CloudWatch request charges.
+
+For low-volume testing the total is negligible, but estimate against your
+real Bedrock traffic before deploying broadly. See the
+[AWS Pricing Calculator](https://calculator.aws/) for current rates.
+
+### Tearing it down
+
+```bash
+npx cdk destroy
+```
+
+Two things to know before you destroy the stack:
+
+- With the default `RemovalPolicy.DESTROY`, the DynamoDB tables (and their
+  data) are deleted. The S3 log bucket and any objects in it are **not**
+  auto-emptied by CDK — empty it manually if you want it removed.
+- Destroying the stack disables the account/region-level Model Invocation
+  Logging configuration this stack enabled (best-effort). If you had a
+  prior configuration before deploying, it is not restored — reconfigure
+  it manually if needed.
 
 ### About Model Invocation Logging
 
@@ -200,7 +240,7 @@ aws lambda invoke \
 ```
 
 Other operations: `listQuotas`, `listAuditEntries`, `removeDenyPolicy`
-(manually restores access before the next day, per Requirement 6.4). See
+(manually restores access before the next day's automatic reset). See
 `src/adminApi.ts` for each operation's exact request/response shape.
 
 If no quota is configured for a `(team, model)` pair, that team is
@@ -301,18 +341,15 @@ nothing that needs manual cleanup unless you want the counters gone sooner.
 
 ## Known limitations / follow-ups
 
-- **IAM permission gaps are the most likely failure mode when extending
-  this stack.** During development, `Usage_Collector` was deployed for a
-  period without `s3:GetObject` on the log bucket — the S3 event
-  notification still triggered the Lambda, but every invocation failed
-  with `AccessDenied` when it tried to read the object it was notified
-  about, and Lambda's built-in async retries masked the failure from
-  casual observation (no data ever reached DynamoDB, with no obvious
-  error surfaced anywhere except CloudWatch Logs). If you add a new
-  Lambda/event source pairing, always verify the *execution role* has
-  every permission the handler code actually calls, not just the trigger
-  wiring — `cdk diff`/`synth` won't catch this since the trigger and the
-  permission are configured independently.
+- **IAM permission gaps are an easy mistake when extending this stack.**
+  A Lambda's event-source wiring (e.g. an S3 notification) and its
+  execution-role permissions (e.g. `s3:GetObject` on the bucket) are
+  configured independently, so a Lambda can be triggered correctly yet
+  still fail at runtime with `AccessDenied` — and Lambda's built-in async
+  retries can mask that failure everywhere except CloudWatch Logs. When
+  you add a new Lambda/event-source pairing, verify the execution role
+  grants every action the handler actually calls, not just the trigger
+  wiring; `cdk diff`/`synth` won't catch a missing runtime permission.
 - **Bedrock Model Invocation Logging delivers S3 objects gzip-compressed**
   (`.json.gz`), not as plain text. `usageCollectorEntry.ts` detects this
   via the gzip magic-byte header and decompresses before parsing; if
@@ -334,26 +371,33 @@ nothing that needs manual cleanup unless you want the counters gone sooner.
   idempotent and verified to survive a clean `rm -rf node_modules && npm install`. If
   a future `aws-cdk-lib` release bundles a non-vulnerable `brace-expansion`, the patch
   and script become no-ops and can be removed.
-- **If `aws sts get-caller-identity --profile <name>` works but SDK-based
-  tools (the CDK CLI, `npm run test:tokens`, etc.) fail with
-  `CredentialsProviderError: Could not load credentials from any providers`
-  for the same profile**, this is very likely a `HOME` resolution mismatch,
-  not a config file problem. The AWS SDK for JavaScript resolves your home
-  directory (and therefore both `~/.aws/config` and the SSO token cache at
-  `~/.aws/sso/cache/`) via the `HOME` environment variable, falling back to
-  `HOMEDRIVE`+`HOMEPATH` if `HOME` is unset — it does **not** use
-  `USERPROFILE`, which is what the AWS CLI and Node's own `os.homedir()`
-  use instead. On Windows machines where `HOMEDRIVE`/`HOMEPATH` point
-  somewhere different from `USERPROFILE` (e.g. a mapped/redirected home
-  drive), this causes the SDK to silently read the wrong (or an empty)
-  config and SSO cache. Fix: set `HOME` to match `USERPROFILE`.
-  - **cmd/PowerShell**: `setx HOME "%USERPROFILE%"` (or the literal path,
-    e.g. `setx HOME "C:\Users\yourname"`), then open a **new** terminal —
-    `setx` never updates the terminal you ran it in.
-  - **git-bash/MINGW64**: bash resolves `$HOME` independently of the
-    Windows env var, so `setx` alone won't fix it here. Add
-    `export HOME="/c/Users/yourname"` (bash-style path) to `~/.bashrc` or
-    `~/.bash_profile`, or `export` it manually each session.
-  - Verify with `node -e "console.log(require('os').homedir())"` (should
-    match `USERPROFILE`) vs. checking what the SDK itself sees — if they
-    disagree, that's the mismatch to fix.
+
+## Troubleshooting
+
+### `CredentialsProviderError` on Windows even though the AWS CLI works
+
+If `aws sts get-caller-identity --profile <name>` works but SDK-based tools
+(the CDK CLI, `npm run test:tokens`, etc.) fail with
+`CredentialsProviderError: Could not load credentials from any providers`
+for the same profile, this is very likely a `HOME` resolution mismatch, not
+a config-file problem.
+
+The AWS SDK for JavaScript resolves your home directory (and therefore both
+`~/.aws/config` and the SSO token cache at `~/.aws/sso/cache/`) via the
+`HOME` environment variable, falling back to `HOMEDRIVE`+`HOMEPATH` if
+`HOME` is unset — it does **not** use `USERPROFILE`, which is what the AWS
+CLI and Node's own `os.homedir()` use. On Windows machines where
+`HOMEDRIVE`/`HOMEPATH` point somewhere different from `USERPROFILE` (e.g. a
+mapped/redirected home drive), the SDK silently reads the wrong (or an
+empty) config and SSO cache. Fix: set `HOME` to match `USERPROFILE`.
+
+- **cmd/PowerShell**: `setx HOME "%USERPROFILE%"` (or the literal path,
+  e.g. `setx HOME "C:\Users\yourname"`), then open a **new** terminal —
+  `setx` never updates the terminal you ran it in.
+- **git-bash/MINGW64**: bash resolves `$HOME` independently of the Windows
+  env var, so `setx` alone won't fix it here. Add
+  `export HOME="/c/Users/yourname"` (bash-style path) to `~/.bashrc` or
+  `~/.bash_profile`, or `export` it manually each session.
+- Verify with `node -e "console.log(require('os').homedir())"` (should
+  match `USERPROFILE`) vs. what the SDK sees — if they disagree, that's the
+  mismatch to fix.

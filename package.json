@@ -19,7 +19,7 @@
   "engines": {
     "node": ">=18"
   },
-  "license": "UNLICENSED",
+  "license": "MIT",
   "dependencies": {
     "@aws-sdk/client-bedrock": "3.1098.0",
     "@aws-sdk/client-bedrock-runtime": "3.1098.0",
