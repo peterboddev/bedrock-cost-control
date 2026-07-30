@@ -324,10 +324,16 @@ nothing that needs manual cleanup unless you want the counters gone sooner.
   described above (needed to hit the 5-minute freshness target). It's a
   natural future addition layered on top of the same S3 bucket for
   longer-horizon reporting.
-- **Dependency vulnerabilities**: `npm audit` currently reports findings in
-  transitively-pinned `@aws-sdk/*`/`@smithy/*` packages shared across this
-  project's pinned SDK version. Worth a deliberate, tested bump of the
-  whole AWS SDK dependency set at some point rather than a piecemeal fix.
+- **Dependency vulnerabilities**: `npm audit` reports **0 vulnerabilities**. One
+  high-severity finding (`brace-expansion` GHSA-mh99-v99m-4gvg) is a *bundled*
+  dependency inside the `aws-cdk-lib` tarball that npm `overrides` can't reach and
+  AWS hasn't yet shipped a patched `aws-cdk-lib` for, so it's fixed at install time
+  via a `postinstall` hook: `patch-package` (see `patches/`) swaps in the patched
+  `brace-expansion@5.0.9` source, and `scripts/fixBundledDepAuditMetadata.js`
+  reconciles the lockfile/`package.json` metadata `npm audit` reads. Both steps are
+  idempotent and verified to survive a clean `rm -rf node_modules && npm install`. If
+  a future `aws-cdk-lib` release bundles a non-vulnerable `brace-expansion`, the patch
+  and script become no-ops and can be removed.
 - **If `aws sts get-caller-identity --profile <name>` works but SDK-based
   tools (the CDK CLI, `npm run test:tokens`, etc.) fail with
   `CredentialsProviderError: Could not load credentials from any providers`

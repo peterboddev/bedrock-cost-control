@@ -64,14 +64,37 @@ test role). The bucket itself is well-secured (SSL-enforced, S3-managed encrypti
 anyone deploying this stack against production Bedrock traffic — not a code
 vulnerability, but worth documenting prominently (see README suggestion below).
 
-### 6. Dependency vulnerabilities (pre-existing, not introduced by this review)
-`npm audit` currently reports **42 vulnerabilities (5 low, 15 moderate, 21 high, 1
-critical)**, all inside transitively-pinned `@aws-sdk/*`/`@smithy/*`/`uuid` packages
-shared across the pinned SDK version used throughout this project. Fixing requires a
-deliberate, tested bump of the whole AWS SDK dependency set (`npm audit fix --force`
-would jump multiple major versions unprompted) — already called out in README's
-"Known limitations" section. Not something to silently `--force` fix as part of a
-routine commit.
+### 6. Fixed — dependency vulnerabilities resolved (`npm audit` clean)
+`npm audit` originally reported **42 vulnerabilities (5 low, 15 moderate, 21 high, 1
+critical)**, all inside transitively-pinned `@aws-sdk/*`/`@smithy/*` packages and
+their nested dependencies. These are now fully resolved — `npm audit` reports **0
+vulnerabilities**, verified to survive a clean `rm -rf node_modules && npm install`.
+
+How it was fixed:
+- **AWS SDK bump**: all `@aws-sdk/*` packages were bumped to `3.1098.0`
+  (`@aws-sdk/util-dynamodb` to `3.996.7`, which versions independently), and
+  `aws-cdk-lib` to `2.262.2`. This cleared 41 of the 42 findings.
+- **Bundled `brace-expansion` (the last, stubborn one)**: the final high-severity
+  finding was `brace-expansion@5.0.7` (GHSA-mh99-v99m-4gvg, a DoS via unbounded
+  expansion length). It is a **bundled dependency** shipped *inside* the `aws-cdk-lib`
+  npm tarball (`bundleDependencies`), so npm's `overrides` field cannot reach it —
+  `npm audit fix` itself reports "It cannot be fixed automatically." AWS has not yet
+  published an `aws-cdk-lib` release with the patched version. Rather than deferring,
+  it was fixed properly with two coordinated, idempotent, install-time steps wired
+  into a `postinstall` hook:
+  1. `patch-package` (see `patches/aws-cdk-lib++brace-expansion+5.0.9.patch`) replaces
+     the vulnerable bundled `brace-expansion` source with the patched `5.0.9`
+     implementation (which caps total expansion length).
+  2. `scripts/fixBundledDepAuditMetadata.js` reconciles the on-disk `package.json`
+     and the `package-lock.json` entry for that bundled copy to the patched version,
+     because `npm audit` keys off lockfile metadata rather than file contents and a
+     fresh install regenerates the lockfile from the tarball's unpatched metadata.
+- **`@smithy/util-stream`**: added as an explicit pinned devDependency (`4.7.16`) —
+  the SDK bump stopped hoisting it transitively, which a unit test's mock helper
+  relied on.
+
+After all changes: `npm audit` = 0 vulnerabilities, 175 tests pass, `npm run build`
+and `npm run infra:check` are clean, and `cdk synth` renders successfully.
 
 ### 7. `.gitignore` coverage (being added as part of this task)
 Before first commit, `.gitignore` needs to exclude at minimum:
@@ -92,4 +115,5 @@ Safe to commit and push after:
 3. You decide on finding #4 (test role trust policy scope) — no blocking issue either
    way, just flagging the tradeoff.
 
-No changes needed for findings #2, #3, #6 — already fine or already documented.
+No changes needed for findings #2, #3 — already fine. Findings #1, #4, and #6 are
+fixed.
