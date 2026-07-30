@@ -1,0 +1,28 @@
+# Kiro spec/task tracking - not part of the public project
+.kiro/
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# CDK synthesis output (regenerable; may contain account/resource naming details)
+cdk.out/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment/local overrides
+.env
+.env.*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Coverage output
+coverage/
