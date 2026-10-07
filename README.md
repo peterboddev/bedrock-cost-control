@@ -338,44 +338,46 @@ that lights up the **dollar** dashboard. **Steps A-H above are the whole
 same-day install — once you finish H, you are done for now. Stop here and come
 back later for step I.**
 
-**Is it time to do step I yet? Run this one check first:**
-
-```bash
-# The ONLY thing that decides whether you can start step I. It is read-only.
-aws ce list-cost-allocation-tags --region us-east-1 \
-  --query "CostAllocationTags[?TagKey=='team'].{Tag:TagKey,Status:Status}" --output table
-```
-
-- **Empty output** → AWS has not catalogued the `team` tag from your usage yet.
-  **You cannot start step I. Stop, wait a few hours (typically ~24-48h after the
-  usage in step F), and re-run this one command later.** Re-running it is the
-  entire "are we there yet?" loop — nothing else to do until it returns a row.
-- **A row for `team`** (any status) → the clock is done. **Proceed into I.1
-  below.**
-
-Everything from here (I.1 → I.3) is for *after* that check returns a row. Do the
-sub-steps strictly in order, and do **not** run the next one until its "wait
-here" check passes — each stage depends on AWS having propagated the previous
-one, and running ahead just produces an empty dashboard you'll have to debug.
+Do the sub-steps strictly in order, and do **not** run the next one until its
+"wait here" check passes — each stage depends on AWS having propagated the
+previous one, and running ahead just produces an empty dashboard you'll have to
+debug.
 
 ---
 
-**I.1 — Activate the `team` cost-allocation tag.**
+**I.1 — Activate the `team` cost-allocation tag. This command is also the "is it
+time yet?" gate.** AWS only lets you activate a tag once billing has catalogued
+spend carrying it, so running this *is* how you find out whether the clock is
+done — there is no separate pre-check to run.
 
 ```bash
 aws ce update-cost-allocation-tags-status --region us-east-1 \
   --cost-allocation-tags-status '[{"TagKey":"team","Status":"Active"}]'
 ```
 
-If this fails with **"Tag keys not found: team"**, AWS hasn't catalogued the
-tag from your usage yet. That is expected, not a misconfiguration — **wait a few
-hours and re-run the exact same command.** Repeat until it succeeds.
+- **Errors with `ValidationException ... Tag keys not found: team`** → AWS has
+  not catalogued the `team` tag from your step-F usage yet. **This is expected,
+  not a misconfiguration. You are done for now — stop, wait a few hours
+  (typically ~24-48h after step F), and re-run this exact command later.**
+  Re-running it is the entire "are we there yet?" loop; nothing else to do until
+  it stops erroring.
+- **Succeeds (no error)** → the tag is now active. Proceed to I.2.
 
-**⛔ WAIT HERE until this check shows `Active`:**
+> Verified live behavior: before the tag is catalogued, the CLI returns a
+> top-level `ValidationException` with message `Failed to update Cost Allocation
+> Tag: Tag keys not found: team` (not an empty success). The AWS API reference's
+> example shows this as a per-entry `TagKeysNotFoundException` in an `Errors`
+> array, but the CLI surfaces it as a `ValidationException` — either way it
+> means the same thing: not catalogued yet, wait and retry. See
+> [UpdateCostAllocationTagsStatus](https://docs.aws.amazon.com/aws-cost-management/latest/APIReference/API_UpdateCostAllocationTagsStatus.html)
+> and [Activating user-defined cost allocation tags](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/activating-tags.html)
+> (a user-defined tag can take up to ~24h to become available to activate, then
+> up to ~24h more to activate).
+
+Optional: confirm the status afterward (shows `Active` once the command above
+succeeded):
 
 ```bash
-# Empty output = not catalogued/active yet → wait and re-run I.1.
-# A row with Status "Active" = done → proceed to I.2.
 aws ce list-cost-allocation-tags --region us-east-1 \
   --query "CostAllocationTags[?TagKey=='team'].{Tag:TagKey,Status:Status}" --output table
 ```
