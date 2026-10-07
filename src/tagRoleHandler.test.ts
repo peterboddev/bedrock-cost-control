@@ -4,6 +4,7 @@ import { handleTagRoleEvent, TagRoleEvent, TagRoleHandlerOptions } from './tagRo
 import { buildModelDenyPolicyDocument, buildModelDenyPolicyName } from './quotaEnforcer';
 import * as dynamoDbClient from './clients/dynamoDbClient';
 import * as iamClient from './clients/iamClient';
+import * as teamRoleCache from './teamRoleCache';
 
 jest.mock('./clients/dynamoDbClient', () => ({
   query: jest.fn(),
@@ -13,10 +14,16 @@ jest.mock('./clients/iamClient', () => ({
   putRolePolicy: jest.fn(),
 }));
 
+jest.mock('./teamRoleCache', () => ({
+  cacheRoleTeam: jest.fn(),
+}));
+
 const mockedQuery = dynamoDbClient.query as jest.Mock;
 const mockedPutRolePolicy = iamClient.putRolePolicy as jest.Mock;
+const mockedCacheRoleTeam = teamRoleCache.cacheRoleTeam as jest.Mock;
 
 const BLOCKED_STATE_TABLE = 'BlockedState';
+const TEAM_ROLE_CACHE_TABLE = 'TeamRoleCache';
 const TEAM_TAG_KEY = 'team';
 const ACCOUNT_ID = '123456789012';
 const ROLE_NAME = 'NewRole';
@@ -26,6 +33,7 @@ const noRetryDelay = { sleep: async () => {} };
 const baseOptions: TagRoleHandlerOptions = {
   teamTagKey: TEAM_TAG_KEY,
   blockedStateTableName: BLOCKED_STATE_TABLE,
+  teamRoleCacheTableName: TEAM_ROLE_CACHE_TABLE,
   retryOptions: { maxAttempts: 3, ...noRetryDelay },
 };
 
@@ -62,6 +70,28 @@ describe('handleTagRoleEvent (unit)', () => {
     mockedQuery.mockReset();
     mockedPutRolePolicy.mockReset();
     mockedPutRolePolicy.mockResolvedValue({});
+    mockedCacheRoleTeam.mockReset();
+    mockedCacheRoleTeam.mockResolvedValue(undefined);
+  });
+
+  it('warms the Team_Role_Cache with the newly tagged role (even with no blocked models)', async () => {
+    mockBlockedModels([]);
+
+    const event = buildTagRoleEvent('teamA');
+    await handleTagRoleEvent(event, baseOptions);
+
+    expect(mockedCacheRoleTeam).toHaveBeenCalledTimes(1);
+    expect(mockedCacheRoleTeam).toHaveBeenCalledWith(
+      `arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}`,
+      'teamA',
+      { tableName: TEAM_ROLE_CACHE_TABLE }
+    );
+  });
+
+  it('does not warm the cache for non-team-tag or UntagRole events', async () => {
+    await handleTagRoleEvent(buildTagRoleEvent(undefined), baseOptions);
+    await handleTagRoleEvent(buildTagRoleEvent('teamA', { eventName: 'UntagRole' }), baseOptions);
+    expect(mockedCacheRoleTeam).not.toHaveBeenCalled();
   });
 
   it('attaches the Model_Deny_Policy for every currently blocked Model to the newly tagged role', async () => {
@@ -70,6 +100,7 @@ describe('handleTagRoleEvent (unit)', () => {
     const event = buildTagRoleEvent('teamA');
     await handleTagRoleEvent(event, baseOptions);
 
+    expect(mockedCacheRoleTeam).toHaveBeenCalledTimes(1);
     expect(mockedQuery).toHaveBeenCalledTimes(1);
     expect(mockedQuery.mock.calls[0][0]).toMatchObject({
       TableName: BLOCKED_STATE_TABLE,
@@ -136,7 +167,7 @@ describe('handleTagRoleEvent (unit)', () => {
 });
 
 const teamArb = fc.string({ minLength: 1, maxLength: 20 }).filter((s) => s.trim().length > 0);
-const modelArb = fc.string({ minLength: 1, maxLength: 20 }).filter((s) => s.trim().length > 0);
+const modelArb = fc.stringOf(fc.constantFrom(...'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._:/'), { minLength: 1, maxLength: 30 }).filter((s) => s.trim().length > 0);
 
 describe('handleTagRoleEvent - Property 15: Newly mapped role inherits an existing block', () => {
   beforeEach(() => {

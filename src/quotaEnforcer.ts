@@ -30,7 +30,9 @@ import { writeAuditEntry } from './auditLog';
 import { deleteItem, getItem, putItem } from './clients/dynamoDbClient';
 import { deleteRolePolicy, putRolePolicy } from './clients/iamClient';
 import { extractRoleNameFromArn } from './arnResolver';
+import { buildMantleDenyPolicyDocument, buildMantleDenyPolicyName } from './mantleDenyPolicy';
 import { publishNotification } from './notifications';
+import { Endpoint } from './pricing/types';
 import { getQuota } from './quotaConfigStore';
 import { RetryOptions, retryWithBackoff } from './retry';
 import { listRolesForTeam } from './teamRoleCache';
@@ -61,6 +63,20 @@ export interface ModelDenyPolicyDocument {
 }
 
 /**
+ * Validates a model identifier for safe use in IAM policy documents (Resource
+ * ARN and Condition values). Rejects empty strings and strings containing
+ * characters that would alter IAM policy semantics (wildcards, whitespace,
+ * control characters, quotes). Model IDs originate from Bedrock invocation
+ * logs (a trusted source), but defense-in-depth requires sanitization before
+ * any value reaches an IAM policy document.
+ */
+function validateModelForPolicy(model: Model): void {
+  if (!model || /[\s"'\\*?{}[\]]/.test(model)) {
+    throw new Error(`Model identifier "${model}" contains characters unsafe for IAM policy generation`);
+  }
+}
+
+/**
  * Builds the Resource ARN a Model_Deny_Policy is scoped to. If `model` is
  * already an ARN (e.g. an inference profile ARN, per the Model glossary
  * entry), it is used as-is; otherwise it is treated as a foundation model
@@ -68,6 +84,7 @@ export interface ModelDenyPolicyDocument {
  * design.md's Model_Deny_Policy JSON structure.
  */
 function buildModelResourceArn(model: Model): string {
+  validateModelForPolicy(model);
   return model.startsWith('arn:') ? model : `arn:aws:bedrock:*::foundation-model/${model}`;
 }
 
@@ -114,6 +131,12 @@ interface BlockedStateItem {
   blockedAt: string;
   status: BlockedStateStatus;
   statusDay: string;
+  /**
+   * Which endpoint's deny policy enforces this block (requirements.md
+   * FR-5.3). Absent on legacy items; readers default to bedrock-runtime so
+   * existing Converse blocks continue to resolve to the same policy name.
+   */
+  endpoint?: Endpoint;
 }
 
 function buildBlockedStatePartitionKey(team: Team): string {
@@ -155,7 +178,8 @@ async function putBlockedState(
   model: Model,
   blockedUsageDay: UsageDay,
   now: Date,
-  tableName: string
+  tableName: string,
+  endpoint: Endpoint = Endpoint.BedrockRuntime
 ): Promise<void> {
   const item: BlockedStateItem = {
     PK: buildBlockedStatePartitionKey(team),
@@ -164,6 +188,7 @@ async function putBlockedState(
     blockedAt: now.toISOString(),
     status: 'BLOCKED',
     statusDay: `BLOCKED#${blockedUsageDay}`,
+    endpoint,
   };
 
   await putItem({
@@ -191,11 +216,18 @@ async function clearBlockedState(team: Team, model: Model, tableName: string): P
  * `iam:PutRolePolicy` (idempotent — attaching the same policy document
  * under the same deterministic name is a no-op if already present).
  */
-async function attachModelDenyPolicy(roleArn: string, model: Model): Promise<void> {
+async function attachModelDenyPolicy(
+  roleArn: string,
+  model: Model,
+  endpoint: Endpoint = Endpoint.BedrockRuntime
+): Promise<void> {
+  const isMantle = endpoint === Endpoint.BedrockMantle;
   await putRolePolicy({
     RoleName: extractRoleNameFromArn(roleArn),
-    PolicyName: buildModelDenyPolicyName(model),
-    PolicyDocument: JSON.stringify(buildModelDenyPolicyDocument(model)),
+    PolicyName: isMantle ? buildMantleDenyPolicyName(model) : buildModelDenyPolicyName(model),
+    PolicyDocument: JSON.stringify(
+      isMantle ? buildMantleDenyPolicyDocument(model) : buildModelDenyPolicyDocument(model)
+    ),
   });
 }
 
@@ -205,10 +237,17 @@ async function attachModelDenyPolicy(roleArn: string, model: Model): Promise<voi
  * name (Requirement 6.3), so it never affects the deny policy for any
  * other Model attached to the same role.
  */
-async function removeModelDenyPolicy(roleArn: string, model: Model): Promise<void> {
+async function removeModelDenyPolicy(
+  roleArn: string,
+  model: Model,
+  endpoint: Endpoint = Endpoint.BedrockRuntime
+): Promise<void> {
   await deleteRolePolicy({
     RoleName: extractRoleNameFromArn(roleArn),
-    PolicyName: buildModelDenyPolicyName(model),
+    PolicyName:
+      endpoint === Endpoint.BedrockMantle
+        ? buildMantleDenyPolicyName(model)
+        : buildModelDenyPolicyName(model),
   });
 }
 
@@ -225,6 +264,12 @@ export interface EvaluateUsageAggregationChangeOptions {
   notificationTopicArn?: string;
   /** Retry options for the `iam:PutRolePolicy` calls (Requirement 5.5). */
   retryOptions?: RetryOptions;
+  /**
+   * Which endpoint serves this model (requirements.md FR-5.3). Selects the
+   * Converse (bedrock-runtime) vs Mantle (bedrock-mantle) deny policy.
+   * Defaults to bedrock-runtime for backward compatibility.
+   */
+  endpoint?: Endpoint;
   /** Injectable clock, primarily for tests. */
   now?: () => Date;
 }
@@ -277,6 +322,7 @@ export async function evaluateUsageAggregationChange(
   options: EvaluateUsageAggregationChangeOptions
 ): Promise<void> {
   const now = (options.now ?? (() => new Date()))();
+  const endpoint = options.endpoint ?? Endpoint.BedrockRuntime;
 
   const quota = await getQuota(team, model, { tableName: options.quotaConfigTableName });
 
@@ -299,7 +345,7 @@ export async function evaluateUsageAggregationChange(
 
   for (const roleArn of roleArns) {
     try {
-      await retryWithBackoff(() => attachModelDenyPolicy(roleArn, model), options.retryOptions);
+      await retryWithBackoff(() => attachModelDenyPolicy(roleArn, model, endpoint), options.retryOptions);
       await writeAuditEntry(
         team,
         model,
@@ -324,7 +370,7 @@ export async function evaluateUsageAggregationChange(
     }
   }
 
-  await putBlockedState(team, model, usageDay, now, options.blockedStateTableName);
+  await putBlockedState(team, model, usageDay, now, options.blockedStateTableName, endpoint);
 
   await publishNotification('blocked', team, model, quota, {
     topicArn: options.notificationTopicArn,
@@ -373,7 +419,10 @@ async function removeDenyForConfigChange(
 
   for (const roleArn of roleArns) {
     try {
-      await retryWithBackoff(() => removeModelDenyPolicy(roleArn, model), options.retryOptions);
+      await retryWithBackoff(
+        () => removeModelDenyPolicy(roleArn, model, options.endpoint ?? Endpoint.BedrockRuntime),
+        options.retryOptions
+      );
       await writeAuditEntry(
         team,
         model,
@@ -432,6 +481,7 @@ interface UnmarshalledUsageAggregationItem {
   model?: unknown;
   usageDay?: unknown;
   runningTotalTokens?: unknown;
+  endpoint?: unknown;
 }
 
 /**
@@ -479,12 +529,15 @@ export async function handleUsageAggregationStreamEvent(
       continue;
     }
 
+    const endpoint =
+      item.endpoint === Endpoint.BedrockMantle ? Endpoint.BedrockMantle : Endpoint.BedrockRuntime;
+
     await evaluateUsageAggregationChange(
       item.team,
       item.model,
       item.usageDay,
       item.runningTotalTokens,
-      options
+      { ...options, endpoint }
     );
   }
 }

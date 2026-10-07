@@ -8,11 +8,26 @@
  *   PK = `TEAM#<team>`
  *   SK = `MODEL#<model>`
  *
+ * Plus a `TeamListIndex` GSI (constant PK `TEAM`, SK = raw team name) that
+ * lets the admin API enumerate the distinct set of teams that have budgets
+ * configured via a single bounded, single-partition Query — never a Scan.
+ *
  * All DynamoDB access here is a targeted PutItem/GetItem/Query keyed on the
- * known partition key `TEAM#<team>` — never a Scan.
+ * known partition key `TEAM#<team>` (or the constant `TeamListIndex`
+ * partition) — never a Scan.
  */
 import { getItem, putItem, query } from './clients/dynamoDbClient';
 import { Model, Team } from './types';
+
+/**
+ * Constant partition-key value for the `TeamListIndex` GSI. Every quota item
+ * carries this on a dedicated attribute so that all teams live in one GSI
+ * partition and can be listed with a single Scan-free Query.
+ */
+const TEAM_LIST_PARTITION = 'TEAM';
+
+/** Name of the GSI used to enumerate distinct teams. Must match infra/stack.ts. */
+export const TEAM_LIST_INDEX_NAME = 'TeamListIndex';
 
 export interface GetQuotaOptions {
   /** Name of the DynamoDB table backing the Quota_Configuration store. */
@@ -45,6 +60,15 @@ interface QuotaConfigurationItem {
   dailyTokenQuota: number;
   updatedAt: string;
   updatedBy?: string;
+  /** Constant GSI partition for `TeamListIndex` (always `TEAM_LIST_PARTITION`). */
+  teamListPk: string;
+  /** Raw team name; the `TeamListIndex` sort key. */
+  team: string;
+}
+
+/** A single item returned by the `TeamListIndex` GSI. */
+interface TeamListIndexItem {
+  team: string;
 }
 
 function buildPartitionKey(team: Team): string {
@@ -113,6 +137,8 @@ export async function putQuota(
     SK: buildSortKey(model),
     dailyTokenQuota,
     updatedAt: now.toISOString(),
+    teamListPk: TEAM_LIST_PARTITION,
+    team,
     ...(options.updatedBy !== undefined ? { updatedBy: options.updatedBy } : {}),
   };
 
@@ -188,4 +214,41 @@ export async function listQuotas(team: Team, options: ListQuotasOptions): Promis
   } while (exclusiveStartKey !== undefined);
 
   return entries;
+}
+
+/**
+ * Lists the distinct set of teams that have at least one budget configured.
+ *
+ * Queries the `TeamListIndex` GSI on its single constant partition
+ * (`TEAM_LIST_PARTITION`) — a bounded, single-partition Query, never a table
+ * Scan. The GSI holds one entry per (team, model) quota item, so the same
+ * team appears once per configured model; this function de-duplicates and
+ * returns a sorted list of unique team names.
+ *
+ * Pagination: follows `LastEvaluatedKey` until exhausted so the full set of
+ * teams is always returned.
+ */
+export async function listTeams(options: ListQuotasOptions): Promise<Team[]> {
+  const teams = new Set<Team>();
+  let exclusiveStartKey: Record<string, unknown> | undefined;
+
+  do {
+    const response = await query({
+      TableName: options.tableName,
+      IndexName: TEAM_LIST_INDEX_NAME,
+      KeyConditionExpression: 'teamListPk = :pk',
+      ExpressionAttributeValues: { ':pk': TEAM_LIST_PARTITION },
+      ExclusiveStartKey: exclusiveStartKey,
+    });
+
+    for (const item of (response.Items ?? []) as TeamListIndexItem[]) {
+      if (item.team) {
+        teams.add(item.team);
+      }
+    }
+
+    exclusiveStartKey = response.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (exclusiveStartKey !== undefined);
+
+  return [...teams].sort((a, b) => a.localeCompare(b));
 }

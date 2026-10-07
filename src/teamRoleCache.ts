@@ -13,7 +13,7 @@
  * partition key `ROLE#<roleArn>`, or (for listRolesForTeam) a bounded,
  * single-partition Query against the `TeamIndex` GSI — never a table Scan.
  */
-import { getItem, putItem, query } from "./clients/dynamoDbClient";
+import { deleteItem, getItem, putItem, query } from "./clients/dynamoDbClient";
 import { getRole, listRoleTags } from "./clients/iamClient";
 import { retryWithBackoff, RetryOptions } from "./retry";
 import { Team, UNMAPPED_ROLE } from "./types";
@@ -62,7 +62,24 @@ interface TeamRoleCacheItem {
   team: Team;
   cachedAt: string;
   ttl: number;
+  /**
+   * Constant partition value for the `RoleListIndex` GSI. Every cached item
+   * carries this on a dedicated attribute so that all role→team mappings live
+   * in one GSI partition and can be enumerated with a single Scan-free Query
+   * (listTeamRoleMappings / listDiscoveredTeams), mirroring the TeamListIndex
+   * pattern on Quota_Configuration.
+   */
+  roleListPk: string;
 }
+
+/**
+ * Constant partition-key value for the `RoleListIndex` GSI (see
+ * `TeamRoleCacheItem.roleListPk`).
+ */
+const ROLE_LIST_PARTITION = "ROLE";
+
+/** Name of the GSI used to enumerate every role→team mapping. Must match infra/stack.ts. */
+export const ROLE_LIST_INDEX_NAME = "RoleListIndex";
 
 function buildPartitionKey(roleArn: string): string {
   return `ROLE#${roleArn}`;
@@ -134,6 +151,7 @@ export async function resolveTeam(
     team,
     cachedAt: now.toISOString(),
     ttl: Math.floor(now.getTime() / 1000) + ttlSeconds,
+    roleListPk: ROLE_LIST_PARTITION,
   };
 
   await putItem({
@@ -148,8 +166,15 @@ export async function resolveTeam(
  * Calls `iam:GetRole` and `iam:ListRoleTags` for the given role ARN and
  * extracts the value of the configured Team_Tag_Key, returning UNMAPPED_ROLE
  * when the tag is absent.
+ *
+ * Exported for the reconciliation sweep (`src/reconciliation.ts`), which needs
+ * to read a role's team straight from IAM *without* the cache-write side
+ * effect that `resolveTeam` performs — the sweep decides for itself whether to
+ * upsert (role has a team) or delete (role has no team) the cache row, so it
+ * must not blindly cache an `UNMAPPED` negative result for every unrelated
+ * role in the account.
  */
-async function resolveTeamFromIam(roleArn: string, teamTagKey: string): Promise<Team> {
+export async function resolveTeamFromIam(roleArn: string, teamTagKey: string): Promise<Team> {
   const roleName = extractRoleNameFromArn(roleArn);
 
   await getRole({ RoleName: roleName });
@@ -163,6 +188,65 @@ async function resolveTeamFromIam(roleArn: string, teamTagKey: string): Promise<
   }
 
   return UNMAPPED_ROLE;
+}
+
+export interface CacheRoleTeamOptions {
+  /** Name of the DynamoDB table backing the Team_Role_Cache. */
+  tableName: string;
+  /** Cache TTL in seconds; defaults to 15 minutes. */
+  cacheTtlSeconds?: number;
+  /** Injectable clock, primarily for tests. */
+  now?: () => Date;
+}
+
+/**
+ * Upserts a role -> team mapping into the Team_Role_Cache directly, without
+ * an IAM call. Used by the TagRole handler to warm the cache the instant a
+ * role is tagged into a team (the CloudTrail event already carries the team
+ * tag value), so enforcement can resolve the team's roles via
+ * `listRolesForTeam` immediately — closing the window where a newly tagged
+ * (e.g. Mantle-only) team's roles would otherwise be invisible to
+ * enforcement until the next periodic reconciliation sweep.
+ */
+export async function cacheRoleTeam(
+  roleArn: string,
+  team: Team,
+  options: CacheRoleTeamOptions
+): Promise<void> {
+  const now = (options.now ?? (() => new Date()))();
+  const ttlSeconds = options.cacheTtlSeconds ?? DEFAULT_CACHE_TTL_SECONDS;
+  const item: TeamRoleCacheItem = {
+    PK: buildPartitionKey(roleArn),
+    team,
+    cachedAt: now.toISOString(),
+    ttl: Math.floor(now.getTime() / 1000) + ttlSeconds,
+    roleListPk: ROLE_LIST_PARTITION,
+  };
+  await putItem({ TableName: options.tableName, Item: item });
+}
+
+export interface DeleteRoleTeamOptions {
+  /** Name of the DynamoDB table backing the Team_Role_Cache. */
+  tableName: string;
+}
+
+/**
+ * Removes a role's Team_Role_Cache entry entirely (targeted DeleteItem on
+ * `ROLE#<roleArn>`). Used by the reconciliation sweep when a role no longer
+ * carries a `team` tag: rather than caching an `UNMAPPED` sentinel for a role
+ * that is not exercising the system, the sweep deletes any stale mapping so
+ * the cache holds only genuinely team-mapped roles. Deleting a non-existent
+ * key is a harmless no-op, so this is safe to call unconditionally for every
+ * untagged role.
+ */
+export async function deleteRoleTeam(
+  roleArn: string,
+  options: DeleteRoleTeamOptions
+): Promise<void> {
+  await deleteItem({
+    TableName: options.tableName,
+    Key: { PK: buildPartitionKey(roleArn) },
+  });
 }
 
 /**
@@ -208,6 +292,76 @@ export async function listRolesForTeam(
   } while (exclusiveStartKey !== undefined);
 
   return roleArns;
+}
+
+/** A single role→team mapping row from the Team_Role_Cache. */
+export interface TeamRoleMapping {
+  roleArn: string;
+  team: Team;
+}
+
+export interface ListTeamRoleMappingsOptions {
+  /** Name of the DynamoDB table backing the Team_Role_Cache. */
+  tableName: string;
+}
+
+/**
+ * Lists every role→team mapping currently in the Team_Role_Cache.
+ *
+ * Queries the `RoleListIndex` GSI on its single constant partition
+ * (`ROLE_LIST_PARTITION`) — a bounded, single-partition `Query`, never a table
+ * `Scan` — following `LastEvaluatedKey` until exhausted. Powers the admin UI's
+ * read-only "discovered mappings" view and `listDiscoveredTeams` below.
+ *
+ * Note this reflects the cache's current contents: roles that have called
+ * Bedrock, been tagged, or been found by the reconcile sweep. Untagged roles
+ * are not present (the sweep deletes rather than caches them), so this is the
+ * set of genuinely team-mapped roles, not every role in the account.
+ */
+export async function listTeamRoleMappings(
+  options: ListTeamRoleMappingsOptions
+): Promise<TeamRoleMapping[]> {
+  const mappings: TeamRoleMapping[] = [];
+  let exclusiveStartKey: Record<string, unknown> | undefined;
+
+  do {
+    const response = await query({
+      TableName: options.tableName,
+      IndexName: ROLE_LIST_INDEX_NAME,
+      KeyConditionExpression: "roleListPk = :pk",
+      ExpressionAttributeValues: { ":pk": ROLE_LIST_PARTITION },
+      ExclusiveStartKey: exclusiveStartKey,
+    });
+
+    const items = (response.Items ?? []) as TeamRoleCacheItem[];
+    for (const item of items) {
+      mappings.push({ roleArn: extractRoleArnFromPartitionKey(item.PK), team: item.team });
+    }
+
+    exclusiveStartKey = response.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (exclusiveStartKey !== undefined);
+
+  return mappings;
+}
+
+/**
+ * Lists the distinct set of teams currently represented in the Team_Role_Cache
+ * (i.e. teams that have at least one mapped role), deduplicated and sorted.
+ * Driven by the same Scan-free `RoleListIndex` Query as `listTeamRoleMappings`.
+ *
+ * Used (unioned with the teams that have budgets configured) to populate the
+ * admin UI's team picker, so a team discovered by the reconcile sweep shows up
+ * for budgeting even before it has any quota set.
+ */
+export async function listDiscoveredTeams(
+  options: ListTeamRoleMappingsOptions
+): Promise<Team[]> {
+  const mappings = await listTeamRoleMappings(options);
+  const teams = new Set<Team>();
+  for (const mapping of mappings) {
+    teams.add(mapping.team);
+  }
+  return [...teams].sort((a, b) => a.localeCompare(b));
 }
 
 /**

@@ -41,7 +41,24 @@ interface AuditLogItem {
   runningTotalTokens: number;
   dailyTokenQuota: number | null;
   timestamp: string;
+  /**
+   * UTC calendar date (`YYYY-MM-DD`) of `timestamp`, partition key of the
+   * `AuditDayIndex` GSI so the analytics export can read all teams' audit
+   * entries for a day via a single-partition Query (never a Scan).
+   */
+  auditDay: string;
   ttl: number;
+}
+
+/** Name of the GSI (PK = `auditDay`) used to read all teams' entries for a day. */
+export const AUDIT_DAY_INDEX_NAME = 'AuditDayIndex';
+
+const TEAM_PARTITION_KEY_PREFIX = 'TEAM#';
+
+function extractTeamFromPartitionKey(partitionKey: string): Team {
+  return partitionKey.startsWith(TEAM_PARTITION_KEY_PREFIX)
+    ? partitionKey.slice(TEAM_PARTITION_KEY_PREFIX.length)
+    : partitionKey;
 }
 
 function buildPartitionKey(team: Team): string {
@@ -101,6 +118,7 @@ export async function writeAuditEntry(
     runningTotalTokens: runningTotal,
     dailyTokenQuota: dailyTokenQuota ?? null,
     timestamp,
+    auditDay: timestamp.slice(0, 10),
     ttl,
   };
 
@@ -156,6 +174,56 @@ export async function listAuditEntries(
     for (const item of items) {
       entries.push({
         team,
+        model: item.model,
+        roleArn: item.roleArn,
+        action: item.action,
+        runningTotalTokens: item.runningTotalTokens,
+        dailyTokenQuota: item.dailyTokenQuota,
+        timestamp: item.timestamp,
+      });
+    }
+
+    exclusiveStartKey = response.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (exclusiveStartKey !== undefined);
+
+  return entries;
+}
+
+export interface ListAuditEntriesByDayOptions {
+  /** Name of the DynamoDB table backing the Audit_Log. */
+  tableName: string;
+  /** Name of the AuditDayIndex GSI; defaults to `AuditDayIndex`. */
+  indexName?: string;
+}
+
+/**
+ * Retrieves every Audit_Log entry across ALL teams for a single UTC day,
+ * via a bounded single-partition Query on the `AuditDayIndex` GSI
+ * (`PK = auditDay`) — never a Scan. Used by the analytics export to build
+ * the admin enforcement-activity view (requirements.md FR-7, admin "see
+ * all").
+ */
+export async function listAuditEntriesByDay(
+  auditDay: string,
+  options: ListAuditEntriesByDayOptions
+): Promise<AuditLogEntry[]> {
+  const entries: AuditLogEntry[] = [];
+  let exclusiveStartKey: Record<string, unknown> | undefined;
+
+  do {
+    const response = await query({
+      TableName: options.tableName,
+      IndexName: options.indexName ?? AUDIT_DAY_INDEX_NAME,
+      KeyConditionExpression: '#auditDay = :auditDay',
+      ExpressionAttributeNames: { '#auditDay': 'auditDay' },
+      ExpressionAttributeValues: { ':auditDay': auditDay },
+      ExclusiveStartKey: exclusiveStartKey,
+    });
+
+    const items = (response.Items ?? []) as AuditLogItem[];
+    for (const item of items) {
+      entries.push({
+        team: extractTeamFromPartitionKey(item.PK),
         model: item.model,
         roleArn: item.roleArn,
         action: item.action,

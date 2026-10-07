@@ -10,6 +10,9 @@ import {
   GetObjectCommand,
   GetObjectCommandInput,
   GetObjectCommandOutput,
+  PutObjectCommand,
+  PutObjectCommandInput,
+  PutObjectCommandOutput,
 } from "@aws-sdk/client-s3";
 
 let s3Client: S3Client | undefined;
@@ -33,4 +36,8 @@ export function setS3Client(client: S3Client): void {
 
 export async function getObject(input: GetObjectCommandInput): Promise<GetObjectCommandOutput> {
   return getS3Client().send(new GetObjectCommand(input));
+}
+
+export async function putObject(input: PutObjectCommandInput): Promise<PutObjectCommandOutput> {
+  return getS3Client().send(new PutObjectCommand(input));
 }

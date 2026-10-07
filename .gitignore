@@ -1,6 +1,9 @@
 # Kiro spec/task tracking - not part of the public project
 .kiro/
 
+# AIDLC workflow documentation — contains account-specific data, not part of the public project
+aidlc-docs/
+
 # Dependencies
 node_modules/
 
@@ -9,6 +12,13 @@ dist/
 
 # CDK synthesis output (regenerable; may contain account/resource naming details)
 cdk.out/
+
+# CDK deploy outputs — contain live account ID, ARNs, endpoints, Cognito pool IDs
+cdk-outputs.json
+*.outputs.json
+
+# Local operational notes — live deployment state, account-specific IDs, pending steps
+DEPLOYMENT_STATE.md
 
 # Logs
 *.log

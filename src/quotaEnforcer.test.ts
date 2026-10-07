@@ -412,7 +412,7 @@ describe('evaluateUsageAggregationChange - remove-on-config-change path', () => 
 
 const teamArb = fc.string({ minLength: 1, maxLength: 20 }).filter((s) => s.trim().length > 0);
 const modelArb = fc
-  .string({ minLength: 1, maxLength: 20 })
+  .stringOf(fc.constantFrom(...'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._:/'), { minLength: 1, maxLength: 30 })
   .filter((s) => s.trim().length > 0 && !s.startsWith('arn:'));
 const roleArnArb = fc
   .tuple(

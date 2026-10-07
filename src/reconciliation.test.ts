@@ -11,6 +11,7 @@ jest.mock('./clients/iamClient', () => ({
 jest.mock('./clients/dynamoDbClient', () => ({
   getItem: jest.fn(),
   putItem: jest.fn(),
+  deleteItem: jest.fn(),
   query: jest.fn(),
 }));
 
@@ -19,6 +20,7 @@ const mockedGetRole = iamClient.getRole as jest.Mock;
 const mockedListRoleTags = iamClient.listRoleTags as jest.Mock;
 const mockedGetItem = dynamoDbClient.getItem as jest.Mock;
 const mockedPutItem = dynamoDbClient.putItem as jest.Mock;
+const mockedDeleteItem = dynamoDbClient.deleteItem as jest.Mock;
 
 const TABLE_NAME = 'TeamRoleCache';
 const TEAM_TAG_KEY = 'team';
@@ -30,10 +32,12 @@ describe('reconcileTeamRoleCache', () => {
     mockedListRoleTags.mockReset();
     mockedGetItem.mockReset();
     mockedPutItem.mockReset();
+    mockedDeleteItem.mockReset();
 
     mockedGetRole.mockResolvedValue({});
     mockedGetItem.mockResolvedValue({ Item: undefined });
     mockedPutItem.mockResolvedValue({});
+    mockedDeleteItem.mockResolvedValue({});
   });
 
   // Validates: Requirements 1.5
@@ -107,20 +111,12 @@ describe('reconcileTeamRoleCache', () => {
   });
 
   // Validates: Requirements 1.5
-  it('re-resolves via IAM even when a fresh, non-expired cache entry already exists (forceRefresh)', async () => {
+  it('reads tags straight from IAM and upserts, regardless of any existing cache entry (no cache read)', async () => {
     const roleArn = 'arn:aws:iam::123456789012:role/MyRole';
     const now = new Date('2025-01-15T12:00:00.000Z');
     mockedListRoles.mockResolvedValueOnce({
       Roles: [{ Arn: roleArn }],
       IsTruncated: false,
-    });
-    mockedGetItem.mockResolvedValue({
-      Item: {
-        PK: `ROLE#${roleArn}`,
-        team: 'staleTeam',
-        cachedAt: '2025-01-15T11:59:00.000Z',
-        ttl: Math.floor(now.getTime() / 1000) + 600,
-      },
     });
     mockedListRoleTags.mockResolvedValue({
       Tags: [{ Key: TEAM_TAG_KEY, Value: 'freshTeam' }],
@@ -134,11 +130,48 @@ describe('reconcileTeamRoleCache', () => {
 
     expect(mockedGetRole).toHaveBeenCalledTimes(1);
     expect(mockedListRoleTags).toHaveBeenCalledTimes(1);
+    // The sweep upserts straight from IAM — it never READS the cache first.
+    expect(mockedGetItem).not.toHaveBeenCalled();
+    expect(mockedPutItem.mock.calls[0][0]).toMatchObject({
+      Item: { PK: `ROLE#${roleArn}`, team: 'freshTeam' },
+    });
     expect(result.reconciledRoles).toEqual([{ roleArn, team: 'freshTeam' }]);
   });
 
   // Validates: Requirements 1.5
-  it('never uses a DynamoDB Scan (only GetItem/PutItem via resolveTeam)', async () => {
+  it('DELETES the cache row (does not cache UNMAPPED) for a role with no team tag, and excludes it from reconciledRoles', async () => {
+    const taggedArn = 'arn:aws:iam::123456789012:role/Tagged';
+    const untaggedArn = 'arn:aws:iam::123456789012:role/Untagged';
+    mockedListRoles.mockResolvedValueOnce({
+      Roles: [{ Arn: taggedArn }, { Arn: untaggedArn }],
+      IsTruncated: false,
+    });
+    mockedListRoleTags.mockImplementation(({ RoleName }: { RoleName: string }) =>
+      RoleName === 'Tagged'
+        ? Promise.resolve({ Tags: [{ Key: TEAM_TAG_KEY, Value: 'teamX' }] })
+        : Promise.resolve({ Tags: [] })
+    );
+
+    const result = await reconcileTeamRoleCache({
+      teamTagKey: TEAM_TAG_KEY,
+      teamRoleCacheTableName: TABLE_NAME,
+    });
+
+    // Tagged role upserted; untagged role's row deleted (drift correction), not cached as UNMAPPED.
+    expect(mockedPutItem).toHaveBeenCalledTimes(1);
+    expect(mockedPutItem.mock.calls[0][0]).toMatchObject({
+      Item: { PK: `ROLE#${taggedArn}`, team: 'teamX' },
+    });
+    expect(mockedDeleteItem).toHaveBeenCalledTimes(1);
+    expect(mockedDeleteItem.mock.calls[0][0]).toMatchObject({
+      Key: { PK: `ROLE#${untaggedArn}` },
+    });
+    // Only the genuinely mapped role is reported.
+    expect(result.reconciledRoles).toEqual([{ roleArn: taggedArn, team: 'teamX' }]);
+  });
+
+  // Validates: Requirements 1.5
+  it('never uses a DynamoDB Scan', async () => {
     const roleArn = 'arn:aws:iam::123456789012:role/MyRole';
     mockedListRoles.mockResolvedValueOnce({
       Roles: [{ Arn: roleArn }],
@@ -154,7 +187,6 @@ describe('reconcileTeamRoleCache', () => {
     });
 
     expect((dynamoDbClient as Record<string, unknown>).scan).toBeUndefined();
-    expect(mockedGetItem).toHaveBeenCalled();
     expect(mockedPutItem).toHaveBeenCalled();
   });
 
@@ -201,5 +233,56 @@ describe('reconcileTeamRoleCache', () => {
     });
 
     expect(mockedListRoles.mock.calls[0][0]).toMatchObject({ PathPrefix: '/service-role/' });
+  });
+
+  it('stops early and returns nextMarker when maxPages is reached with more pages remaining', async () => {
+    const roleA = { Arn: 'arn:aws:iam::123456789012:role/A' };
+    const roleB = { Arn: 'arn:aws:iam::123456789012:role/B' };
+    // Page 1 (truncated) then page 2 (truncated) — but maxPages=1 stops after page 1.
+    mockedListRoles.mockResolvedValueOnce({ Roles: [roleA], IsTruncated: true, Marker: 'after-page-1' });
+    mockedGetItem.mockResolvedValue({});
+    mockedGetRole.mockResolvedValue({});
+    mockedListRoleTags.mockResolvedValue({ Tags: [{ Key: TEAM_TAG_KEY, Value: 'teamA' }] });
+
+    const result = await reconcileTeamRoleCache({
+      teamTagKey: TEAM_TAG_KEY,
+      teamRoleCacheTableName: TABLE_NAME,
+      maxPages: 1,
+    });
+
+    expect(result.complete).toBe(false);
+    expect(result.nextMarker).toBe('after-page-1');
+    expect(result.pageCount).toBe(1);
+    expect(result.reconciledRoles.map((r) => r.roleArn)).toEqual([roleA.Arn]);
+    // Only one ListRoles call happened — the second page was NOT fetched.
+    expect(mockedListRoles).toHaveBeenCalledTimes(1);
+    void roleB;
+  });
+
+  it('resumes from a provided startMarker', async () => {
+    mockedListRoles.mockResolvedValueOnce({ Roles: [], IsTruncated: false });
+
+    const result = await reconcileTeamRoleCache({
+      teamTagKey: TEAM_TAG_KEY,
+      teamRoleCacheTableName: TABLE_NAME,
+      startMarker: 'resume-here',
+    });
+
+    expect(mockedListRoles.mock.calls[0][0]).toMatchObject({ Marker: 'resume-here' });
+    expect(result.complete).toBe(true);
+    expect(result.nextMarker).toBeUndefined();
+  });
+
+  it('marks complete=true when pagination exhausts within maxPages', async () => {
+    mockedListRoles.mockResolvedValueOnce({ Roles: [], IsTruncated: false });
+
+    const result = await reconcileTeamRoleCache({
+      teamTagKey: TEAM_TAG_KEY,
+      teamRoleCacheTableName: TABLE_NAME,
+      maxPages: 5,
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.nextMarker).toBeUndefined();
   });
 });

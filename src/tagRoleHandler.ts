@@ -20,8 +20,10 @@
  */
 import { query } from './clients/dynamoDbClient';
 import { putRolePolicy } from './clients/iamClient';
-import { buildModelDenyPolicyDocument, buildModelDenyPolicyName } from './quotaEnforcer';
+import { buildDenyPolicy } from './denyPolicyFactory';
+import { Endpoint } from './pricing/types';
 import { retryWithBackoff, RetryOptions } from './retry';
+import { cacheRoleTeam } from './teamRoleCache';
 import { Model, Team } from './types';
 
 /** A single tag key/value pair as carried in a CloudTrail `TagRole` event. */
@@ -54,6 +56,13 @@ export interface TagRoleHandlerOptions {
   teamTagKey: string;
   /** Name of the DynamoDB table backing the Blocked_State store. */
   blockedStateTableName: string;
+  /**
+   * Name of the DynamoDB table backing the Team_Role_Cache. The handler
+   * warms this cache with the newly tagged role's team mapping so
+   * enforcement (Converse or Mantle) can resolve the team's roles
+   * immediately, without waiting for the periodic reconciliation sweep.
+   */
+  teamRoleCacheTableName: string;
   /** Retry options for the `iam:PutRolePolicy` calls (Requirement 5.5). */
   retryOptions?: RetryOptions;
 }
@@ -62,6 +71,13 @@ interface BlockedStateItem {
   PK: string;
   SK: string;
   status: 'BLOCKED' | 'PENDING_RESET';
+  endpoint?: Endpoint;
+}
+
+/** A currently-blocked model plus the endpoint whose deny policy enforces it. */
+interface BlockedModel {
+  model: Model;
+  endpoint: Endpoint;
 }
 
 function buildBlockedStatePartitionKey(team: Team): string {
@@ -87,8 +103,8 @@ function extractModelFromSortKey(sortKey: string): Model {
  * `LastEvaluatedKey`; this function follows `LastEvaluatedKey` until
  * exhausted so callers always receive the complete set of blocked Models.
  */
-async function listBlockedModelsForTeam(team: Team, tableName: string): Promise<Model[]> {
-  const models: Model[] = [];
+async function listBlockedModelsForTeam(team: Team, tableName: string): Promise<BlockedModel[]> {
+  const models: BlockedModel[] = [];
   let exclusiveStartKey: Record<string, unknown> | undefined;
 
   do {
@@ -102,7 +118,10 @@ async function listBlockedModelsForTeam(team: Team, tableName: string): Promise<
     const items = (response.Items ?? []) as BlockedStateItem[];
     for (const item of items) {
       if (item.status === 'BLOCKED') {
-        models.push(extractModelFromSortKey(item.SK));
+        models.push({
+          model: extractModelFromSortKey(item.SK),
+          endpoint: item.endpoint === Endpoint.BedrockMantle ? Endpoint.BedrockMantle : Endpoint.BedrockRuntime,
+        });
       }
     }
 
@@ -165,6 +184,13 @@ export async function handleTagRoleEvent(
     return roleArn;
   }
 
+  // Warm the Team_Role_Cache immediately so this role is enforceable (via
+  // listRolesForTeam) the moment it is tagged — this is what makes a newly
+  // tagged, Mantle-only team's roles visible to enforcement without waiting
+  // for the periodic reconciliation sweep. Done regardless of whether the
+  // team currently has any blocked models.
+  await cacheRoleTeam(roleArn, team, { tableName: options.teamRoleCacheTableName });
+
   const blockedModels = await listBlockedModelsForTeam(team, options.blockedStateTableName);
   if (blockedModels.length === 0) {
     return roleArn;
@@ -172,16 +198,15 @@ export async function handleTagRoleEvent(
 
   const roleName = detail.requestParameters.roleName;
 
-  for (const model of blockedModels) {
-    const policyName = buildModelDenyPolicyName(model);
-    const policyDocument = JSON.stringify(buildModelDenyPolicyDocument(model));
+  for (const blocked of blockedModels) {
+    const policy = buildDenyPolicy(blocked.model, blocked.endpoint);
 
     await retryWithBackoff(
       () =>
         putRolePolicy({
           RoleName: roleName,
-          PolicyName: policyName,
-          PolicyDocument: policyDocument,
+          PolicyName: policy.name,
+          PolicyDocument: policy.document,
         }),
       options.retryOptions
     );

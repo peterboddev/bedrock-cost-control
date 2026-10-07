@@ -16,8 +16,10 @@ import { extractRoleNameFromArn } from './arnResolver';
 import { writeAuditEntry } from './auditLog';
 import { deleteItem, putItem, query } from './clients/dynamoDbClient';
 import { deleteRolePolicy } from './clients/iamClient';
+import { buildDenyPolicyName } from './denyPolicyFactory';
 import { publishNotification } from './notifications';
-import { BlockedStateStatus, buildModelDenyPolicyName, getBlockedState } from './quotaEnforcer';
+import { Endpoint } from './pricing/types';
+import { BlockedStateStatus, getBlockedState } from './quotaEnforcer';
 import { retryWithBackoff, RetryOptions } from './retry';
 import { listRolesForTeam } from './teamRoleCache';
 import { Model, Team, UsageDay } from './types';
@@ -56,6 +58,7 @@ interface BlockedStateItem {
   blockedAt: string;
   status: BlockedStateStatus;
   statusDay: string;
+  endpoint?: Endpoint;
 }
 
 /** Prefix used for the `PENDING_RESET` `status`/`statusDay` value, per design.md's Blocked_State schema. */
@@ -67,6 +70,8 @@ interface BlockedStatePairToReset {
   model: Model;
   /** The Usage_Day whose quota breach caused the original block, preserved across retries. */
   blockedUsageDay: UsageDay;
+  /** Which endpoint's deny policy enforces this block (default bedrock-runtime for legacy items). */
+  endpoint: Endpoint;
 }
 
 /**
@@ -109,6 +114,7 @@ async function queryPairsByStatusDay(
         team: extractTeamFromPartitionKey(item.PK),
         model: extractModelFromSortKey(item.SK),
         blockedUsageDay: item.blockedUsageDay,
+        endpoint: item.endpoint === Endpoint.BedrockMantle ? Endpoint.BedrockMantle : Endpoint.BedrockRuntime,
       });
     }
 
@@ -151,7 +157,7 @@ async function resetBlockedStatePair(
   options: DailyResetOptions
 ): Promise<void> {
   const roleArns = await listRolesForTeam(pair.team, { tableName: options.teamRoleCacheTableName });
-  const policyName = buildModelDenyPolicyName(pair.model);
+  const policyName = buildDenyPolicyName(pair.model, pair.endpoint);
 
   let anyRoleFailed = false;
 
@@ -204,6 +210,7 @@ async function resetBlockedStatePair(
         blockedAt: timestamp,
         status: PENDING_RESET_STATUS,
         statusDay: `${PENDING_RESET_STATUS}#${pair.blockedUsageDay}`,
+        endpoint: pair.endpoint,
       } as BlockedStateItem,
     });
     return;
@@ -286,6 +293,7 @@ export async function removeDenyPolicy(
 
   const existing = await getBlockedState(team, model, options.blockedStateTableName);
   const blockedUsageDay = existing?.blockedUsageDay ?? computeUsageDay(now.toISOString());
+  const endpoint = existing?.endpoint === Endpoint.BedrockMantle ? Endpoint.BedrockMantle : Endpoint.BedrockRuntime;
 
-  await resetBlockedStatePair({ team, model, blockedUsageDay }, now.toISOString(), options);
+  await resetBlockedStatePair({ team, model, blockedUsageDay, endpoint }, now.toISOString(), options);
 }

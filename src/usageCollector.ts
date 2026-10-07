@@ -7,6 +7,7 @@
 
 import { resolveUnderlyingRoleArn } from './arnResolver';
 import { transactWrite } from './clients/dynamoDbClient';
+import { Endpoint } from './pricing/types';
 import { resolveTeam } from './teamRoleCache';
 import { computeTtl } from './ttl';
 import { RetryOptions } from './retry';
@@ -24,6 +25,15 @@ export interface ParsedInvocationLogEntry {
   modelId: Model;
   inputTokenCount: number;
   outputTokenCount: number;
+  /**
+   * Prompt-cache read token count, when the invocation log carries it
+   * (`input.cacheReadInputTokenCount`). Undefined when absent — required
+   * for accurate cost reconciliation (requirements.md FR-4.4), since cache
+   * tokens are priced differently from plain input/output tokens.
+   */
+  cacheReadTokenCount?: number;
+  /** Prompt-cache write token count (`input.cacheWriteInputTokenCount`), when present. */
+  cacheWriteTokenCount?: number;
   timestamp: string;
 }
 
@@ -68,6 +78,27 @@ export function parseInvocationLogEntry(rawEntry: unknown): ParsedInvocationLogE
       ? (output as Record<string, unknown>).outputTokenCount
       : undefined;
 
+  // Optional prompt-cache token counts (Bedrock places these under `input`).
+  // They are not required for a valid entry; when absent or non-numeric
+  // they are simply omitted (left undefined) so cost accounting treats
+  // them as zero without rejecting the entry.
+  const rawCacheReadTokenCount =
+    typeof input === 'object' && input !== null
+      ? (input as Record<string, unknown>).cacheReadInputTokenCount
+      : undefined;
+  const rawCacheWriteTokenCount =
+    typeof input === 'object' && input !== null
+      ? (input as Record<string, unknown>).cacheWriteInputTokenCount
+      : undefined;
+  const cacheReadTokenCount =
+    typeof rawCacheReadTokenCount === 'number' && Number.isFinite(rawCacheReadTokenCount)
+      ? rawCacheReadTokenCount
+      : undefined;
+  const cacheWriteTokenCount =
+    typeof rawCacheWriteTokenCount === 'number' && Number.isFinite(rawCacheWriteTokenCount)
+      ? rawCacheWriteTokenCount
+      : undefined;
+
   if (
     typeof requestId !== 'string' ||
     requestId.length === 0 ||
@@ -91,6 +122,8 @@ export function parseInvocationLogEntry(rawEntry: unknown): ParsedInvocationLogE
     modelId,
     inputTokenCount,
     outputTokenCount,
+    cacheReadTokenCount,
+    cacheWriteTokenCount,
     timestamp,
   };
 }
@@ -219,6 +252,8 @@ export async function processInvocationLogEntry(
   const usageDay = computeUsageDay(entry.timestamp);
 
   const incrementAmount = entry.inputTokenCount + entry.outputTokenCount;
+  const cacheReadTokens = entry.cacheReadTokenCount ?? 0;
+  const cacheWriteTokens = entry.cacheWriteTokenCount ?? 0;
 
   try {
     await transactWrite({
@@ -241,23 +276,39 @@ export async function processInvocationLogEntry(
               PK: buildUsageAggregationPartitionKey(team, entry.modelId),
               SK: buildUsageAggregationSortKey(usageDay),
             },
+            // Keeps the single `runningTotalTokens` counter (used by the
+            // Quota_Enforcer breach decision) AND additionally records the
+            // per-token-type counters + endpoint required for accurate cost
+            // tracking (requirements.md FR-2.2, FR-4). Converse/InvokeModel
+            // usage always originates from the bedrock-runtime endpoint.
             UpdateExpression:
-              'SET #usageDay = :usageDay, #team = :team, #model = :model, #lastUpdatedAt = :now, #ttl = :ttl ADD #runningTotalTokens :increment',
+              'SET #usageDay = :usageDay, #team = :team, #model = :model, #endpoint = :endpoint, #lastUpdatedAt = :now, #ttl = :ttl ' +
+              'ADD #runningTotalTokens :increment, #inputTokens :inputTokens, #outputTokens :outputTokens, #cacheReadTokens :cacheReadTokens, #cacheWriteTokens :cacheWriteTokens',
             ExpressionAttributeNames: {
               '#usageDay': 'usageDay',
               '#team': 'team',
               '#model': 'model',
+              '#endpoint': 'endpoint',
               '#lastUpdatedAt': 'lastUpdatedAt',
               '#ttl': 'ttl',
               '#runningTotalTokens': 'runningTotalTokens',
+              '#inputTokens': 'inputTokens',
+              '#outputTokens': 'outputTokens',
+              '#cacheReadTokens': 'cacheReadTokens',
+              '#cacheWriteTokens': 'cacheWriteTokens',
             },
             ExpressionAttributeValues: {
               ':usageDay': usageDay,
               ':team': team,
               ':model': entry.modelId,
+              ':endpoint': Endpoint.BedrockRuntime,
               ':now': now.toISOString(),
               ':ttl': computeTtl(usageDay, USAGE_AGGREGATION_MIN_RETENTION_DAYS),
               ':increment': incrementAmount,
+              ':inputTokens': entry.inputTokenCount,
+              ':outputTokens': entry.outputTokenCount,
+              ':cacheReadTokens': cacheReadTokens,
+              ':cacheWriteTokens': cacheWriteTokens,
             },
           },
         },

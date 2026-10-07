@@ -14,5 +14,6 @@ export async function handler(event: TagRoleEvent): Promise<string> {
   return handleTagRoleEvent(event, {
     teamTagKey: requiredEnv(ENV_VAR_NAMES.TEAM_TAG_KEY),
     blockedStateTableName: requiredEnv(ENV_VAR_NAMES.BLOCKED_STATE_TABLE_NAME),
+    teamRoleCacheTableName: requiredEnv(ENV_VAR_NAMES.TEAM_ROLE_CACHE_TABLE_NAME),
   });
 }

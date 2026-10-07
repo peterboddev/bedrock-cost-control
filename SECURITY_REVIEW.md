@@ -1,119 +1,164 @@
-# Security Review — bedrock-team-token-quota
+# Security Review
 
-Reviewed before first commit/push to `https://github.com/peterboddev/bedrock-cost-control.git`.
+Pre-publication review for public GitHub release. Last updated during the
+security hardening pass (October 2026).
 
-## Summary
+## Secrets / credential scan
 
-No secrets, credentials, or private keys found in the codebase. Two account-specific
-references were found and fixed. IAM policies use exact per-action grants throughout
-(no `dynamodb:Scan`, no wildcard managed policies). A few items below are worth a
-decision before/after pushing.
+No secrets, API keys, passwords, or access keys appear in any tracked file.
 
-## Findings
+- `cdk-outputs.json` (live account ID, endpoints, Cognito pool IDs) — gitignored.
+- `web/.env` (Cognito config for the local dev instance) — gitignored.
+- `aidlc-docs/` (AIDLC workflow docs with account-specific data) — gitignored.
+- `cdk.out/` — gitignored.
+- No AWS access key patterns (`AKIA*`/`ASIA*`) found.
+- No personal emails or usernames in tracked source.
+- The `.gitignore` explicitly covers `cdk-outputs.json`, `*.outputs.json`,
+  `aidlc-docs/`, `.kiro/`, `web/.env*`, and `cdk.out/`.
 
-### 1. Fixed — account ID in a code comment
-`infra/bin/app.ts` had an example `AWS_PROFILE` value containing the real account ID
-(`450683699755`) in a comment. Not a secret, but unnecessary in a shared repo.
-**Fixed**: replaced with a generic placeholder (`<your-sso-profile-name>`).
+## IAM least-privilege
 
-### 2. No secrets/credentials found
-- No `.env` files, no hardcoded `accessKeyId`/`secretAccessKey`/`sessionToken` anywhere
-  in `src/`, `scripts/`, or `infra/`.
-- No private keys, no AWS access key patterns (`AKIA...`), no other 12-digit account
-  IDs left in source, docs, or config after the fix above.
-- `console.error`/`console.warn` calls (in `notifications.ts` and the Model Invocation
-  Logging custom resource) only log team/model/action metadata and error objects —
-  never tokens or credentials.
+Every Lambda execution role uses per-action, per-resource grants via the
+custom `grantExactTableActions()` helper. CDK's `grantReadData` /
+`grantWriteData` / `grantReadWriteData` (which unconditionally add
+`dynamodb:Scan` and other unused actions) are never used. Confirmed via
+search: no `grantReadData`/`grantWriteData`/`grantReadWriteData` calls or
+`dynamodb:Scan` actions anywhere in the stack.
 
-### 3. IAM: `Resource: "*"` grants — reviewed, each is justified
-Several Lambdas have `Resource: "*"` on specific IAM/Bedrock actions. In every case
-this is because the action targets resources not known at deploy time (e.g. any IAM
-role that gets tagged into a team) or the AWS API has no resource-level ARN to scope to
-(the Bedrock Model Invocation Logging *account-level* configuration). None of these are
-wildcard action lists — each is restricted to exactly 1-3 specific actions:
-- `iam:GetRole`, `iam:ListRoleTags` (read-only tag lookups)
-- `iam:PutRolePolicy`, `iam:DeleteRolePolicy` (deny-policy attach/remove on dynamically
-  tagged roles)
-- `iam:ListRoles` (reconciliation's account-wide enumeration)
-- `bedrock:PutModelInvocationLoggingConfiguration`,
-  `bedrock:DeleteModelInvocationLoggingConfiguration` (account-level singleton setting)
+### Intentional `Resource: "*"` grants (documented in `infra/stack.ts`)
 
-No `dynamodb:Scan` anywhere, and no CDK `grantReadData`/`grantWriteData`/
-`grantReadWriteData` convenience grants are used (those add `Scan` automatically) —
-every DynamoDB grant is an exact action list scoped to a specific table/GSI ARN.
+| Lambda | Actions | Why `*` |
+|---|---|---|
+| Quota_Enforcer | `iam:PutRolePolicy`, `iam:DeleteRolePolicy` | Target roles are determined at runtime by Team tag; not knowable at deploy time. |
+| TagRole handler | `iam:PutRolePolicy` | Same reason; only attaches, never deletes. |
+| Daily_Reset | `iam:DeleteRolePolicy` | Same reason; only removes, never attaches. |
+| Admin API | `iam:DeleteRolePolicy` | `removeDenyPolicy` manual override. |
+| Usage_Collector | `iam:GetRole`, `iam:ListRoleTags` | Read-only tag lookup; IAM has no resource-level scoping for these. |
+| Reconciliation | `iam:ListRoles`, `iam:GetRole`, `iam:ListRoleTags` | Paginates all roles; read-only enumeration. |
+| Mantle collector | `cloudwatch:GetMetricData` | CloudWatch does not support resource-level scoping. |
+| Model Invocation Logging | `bedrock:Put/DeleteModelInvocationLoggingConfiguration` | Account singleton, no ARN to scope to. |
 
-### 4. Fixed — `Bedrock_Test_Role` trust policy tightened
-`Bedrock_Test_Role` previously used `assumedBy: new AccountPrincipal(this.account)`,
-letting any principal in the deploying account attempt `sts:AssumeRole` on it. **Fixed**:
-the trust policy now requires an explicit, required stack prop
-(`testRoleTrustedPrincipalArns: string[]`, no default) listing exactly which IAM
-user/role ARN(s) may assume it, wired via `ArnPrincipal`/`CompositePrincipal`. The CDK
-app entry point (`infra/bin/app.ts`) reads this from a required
-`TEST_ROLE_TRUSTED_PRINCIPAL_ARNS` environment variable and fails fast with a clear
-error if it's unset — deploying can no longer silently default to account-wide trust.
-Verified via `cdk synth` that the rendered `AssumeRolePolicyDocument` contains only the
-explicit ARN(s) passed in, no wildcards.
+**Production hardening recommendation**: Use SCPs or `iam:ResourceTag`
+condition keys to constrain which roles the `PutRolePolicy`/`DeleteRolePolicy`
+Lambdas can modify (e.g., only roles tagged `managed-by = bedrock-quota`).
 
-### 5. Data sensitivity: Model Invocation Logging captures full prompts/completions
-The stack enables `textDataDeliveryEnabled: true` on Bedrock Model Invocation Logging,
-which means the S3 bucket (`ModelInvocationLogBucket`) stores the **full text of every
-prompt and completion** sent through any role tagged into a tracked team, across the
-whole account/region (this is an account-level Bedrock setting, not scoped to just the
-test role). The bucket itself is well-secured (SSL-enforced, S3-managed encryption,
-`BlockPublicAccess.BLOCK_ALL`), but this is a real data-handling consideration for
-anyone deploying this stack against production Bedrock traffic — not a code
-vulnerability, but worth documenting prominently (see README suggestion below).
+### Cognito authenticated role
 
-### 6. Fixed — dependency vulnerabilities resolved (`npm audit` clean)
-`npm audit` originally reported **42 vulnerabilities (5 low, 15 moderate, 21 high, 1
-critical)**, all inside transitively-pinned `@aws-sdk/*`/`@smithy/*` packages and
-their nested dependencies. These are now fully resolved — `npm audit` reports **0
-vulnerabilities**, verified to survive a clean `rm -rf node_modules && npm install`.
+Scoped to exactly `execute-api:Invoke` on
+`adminApi.arnForExecuteApi("POST", "/admin", "prod")` — one method, one
+resource, one stage. No other AWS action or resource is granted.
 
-How it was fixed:
-- **AWS SDK bump**: all `@aws-sdk/*` packages were bumped to `3.1098.0`
-  (`@aws-sdk/util-dynamodb` to `3.996.7`, which versions independently), and
-  `aws-cdk-lib` to `2.262.2`. This cleared 41 of the 42 findings.
-- **Bundled `brace-expansion` (the last, stubborn one)**: the final high-severity
-  finding was `brace-expansion@5.0.7` (GHSA-mh99-v99m-4gvg, a DoS via unbounded
-  expansion length). It is a **bundled dependency** shipped *inside* the `aws-cdk-lib`
-  npm tarball (`bundleDependencies`), so npm's `overrides` field cannot reach it —
-  `npm audit fix` itself reports "It cannot be fixed automatically." AWS has not yet
-  published an `aws-cdk-lib` release with the patched version. Rather than deferring,
-  it was fixed properly with two coordinated, idempotent, install-time steps wired
-  into a `postinstall` hook:
-  1. `patch-package` (see `patches/aws-cdk-lib++brace-expansion+5.0.9.patch`) replaces
-     the vulnerable bundled `brace-expansion` source with the patched `5.0.9`
-     implementation (which caps total expansion length).
-  2. `scripts/fixBundledDepAuditMetadata.js` reconciles the on-disk `package.json`
-     and the `package-lock.json` entry for that bundled copy to the patched version,
-     because `npm audit` keys off lockfile metadata rather than file contents and a
-     fresh install regenerates the lockfile from the tarball's unpatched metadata.
-- **`@smithy/util-stream`**: added as an explicit pinned devDependency (`4.7.16`) —
-  the SDK bump stopped hoisting it transitively, which a unit test's mock helper
-  relied on.
+### Bedrock_Test_Role trust policy
 
-After all changes: `npm audit` = 0 vulnerabilities, 175 tests pass, `npm run build`
-and `npm run infra:check` are clean, and `cdk synth` renders successfully.
+Requires explicit `TEST_ROLE_TRUSTED_PRINCIPAL_ARNS` (fails fast if empty).
+Never trusts the whole account.
 
-### 7. `.gitignore` coverage (being added as part of this task)
-Before first commit, `.gitignore` needs to exclude at minimum:
-- `.kiro/` (per your instruction — spec/task tracking, not meant for the public repo)
-- `node_modules/`
-- `dist/` (compiled build output)
-- `cdk.out/` (CDK synthesis output — contains the full rendered CloudFormation
-  template and Lambda bundles; regenerable, and templates can reveal account/resource
-  naming details)
-- Standard OS/editor cruft (`.DS_Store`, etc.)
+## S3 bucket security
 
-## Recommendation
+| Bucket | BlockPublicAccess | Encryption | enforceSSL | Lifecycle |
+|---|---|---|---|---|
+| ModelInvocationLogBucket | BLOCK_ALL | S3_MANAGED | Yes | 90-day expiration |
+| AnalyticsExportBucket | BLOCK_ALL | S3_MANAGED | Yes | 365-day expiration |
 
-Safe to commit and push after:
-1. `.gitignore` is added (this task).
-2. README is refreshed to reflect current state (this task) — should explicitly
-   mention the prompt/completion data-capture behavior from finding #5.
-3. You decide on finding #4 (test role trust policy scope) — no blocking issue either
-   way, just flagging the tradeoff.
+**Note**: `textDataDeliveryEnabled: true` in Model Invocation Logging means
+full prompt/completion text is stored in S3 (not just token counts). This is
+required because token counts are only available as part of the same log
+entry. See README's "Data captured by this system" section. Consider making
+this a configurable stack prop for production deployments with sensitive data.
 
-No changes needed for findings #2, #3 — already fine. Findings #1, #4, and #6 are
-fixed.
+## API Gateway
+
+- Admin API method: `AuthorizationType.IAM` (SigV4-signed, no unauthenticated access).
+- CORS `allowOrigins: *` with IAM auth is safe — SigV4 authenticates via headers,
+  not cookies, so CORS's credentialed-request protection does not apply.
+- The OPTIONS preflight is unauthenticated (required by the CORS spec).
+
+## Input validation
+
+Every Admin API operation validates payload shape (required fields, types,
+enum membership) via `adminApi.ts`'s `requireNonEmptyString` /
+`requireNumber` / `requireOneOf` / `requireNonNegativeNumber` checks before
+touching any data store. The `operation` field is validated as a string in
+`handleHttp` and dispatched through a switch with a `default` error branch.
+
+## IAM policy injection defense
+
+Model identifiers (which flow into IAM policy Resource ARNs and Condition
+values) are validated via `validateModelForPolicy()` in both
+`quotaEnforcer.ts` and `mantleDenyPolicy.ts` before being embedded in any
+IAM policy document. The validation rejects empty strings and strings
+containing characters that would alter IAM policy semantics (wildcards,
+whitespace, control characters, quotes). Covered by unit tests.
+
+## Error handling
+
+The Admin API's `runHandler` wrapper distinguishes validation errors (whose
+messages are safe to return) from unexpected errors (which are logged
+server-side but return a generic `"Internal error processing request"`
+message). SDK errors, table names, regions, and request IDs are never leaked
+to callers. All callers are IAM-authenticated.
+
+## HTTP security headers
+
+Responses include: `Content-Type: application/json`, `X-Content-Type-Options:
+nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy: default-src
+'none'`, `Strict-Transport-Security`, `Cache-Control: no-store`,
+`Access-Control-Allow-Origin: *`.
+
+## Sensitive data logging
+
+No Lambda handler logs prompts, completions, tokens, credentials, or PII.
+Only `console.error` for SNS publish failures (team/model + error object,
+no sensitive data) and `console.warn` on logging-config delete failure.
+
+## Cognito
+
+- Self-signup disabled (admin-provisioned users only).
+- Password policy: >= 12 chars, upper + lower + digit + symbol.
+- **MFA is OFF by default** (for demo/sandbox frictionless onboarding).
+  Set `Mfa.REQUIRED` in `infra/stack.ts` before any real/customer deployment.
+  TOTP is already configured; flipping the property and redeploying is sufficient.
+- `preventUserExistenceErrors: true` on the app client.
+- Identity Pool: `allowUnauthenticatedIdentities: false`.
+
+## Budget UI (web/)
+
+- No credentials stored in code; Cognito identity pool vends short-lived
+  AWS credentials via `fetchAuthSession`.
+- `web/.env` (containing Cognito pool IDs — not secrets, but deployment-
+  specific) is gitignored; `.env.example` is committed with placeholders.
+- React app uses SigV4-signed fetch via `aws4fetch`; no raw credentials
+  appear in the DOM or network requests.
+- No `dangerouslySetInnerHTML` usage; all data rendered via JSX.
+
+## Removal policies / data retention
+
+`RemovalPolicy.DESTROY` and `autoDeleteObjects: true` are the defaults for
+dev/sandbox convenience. The `tableRemovalPolicy` stack prop exists for
+production deployments — pass `RemovalPolicy.RETAIN`. This is documented
+in both the code and the README.
+
+## Dependencies
+
+All AWS SDK packages pinned to `3.1098.0`; CDK pinned to `2.262.2`.
+DevDependencies are well-known packages at pinned versions. The
+`brace-expansion@5.0.9` override + `patches/` patch-package fix is a
+mitigation for CVE-2024-4067 in CDK's bundled `minimatch`; documented in
+README and `scripts/fixBundledDepAuditMetadata.js`.
+
+## Pre-push checklist
+
+- [x] No secrets/credentials/API keys in any tracked file
+- [x] `cdk-outputs.json` gitignored (contains live account data)
+- [x] `web/.env` gitignored; `.env.example` has placeholders only
+- [x] `aidlc-docs/` gitignored (contains account-specific workflow data)
+- [x] No account ID, personal email, or endpoint URL in tracked source
+- [x] All DynamoDB grants use exact per-action scoping (no Scan)
+- [x] Model IDs validated before IAM policy generation
+- [x] SDK errors not leaked in API responses
+- [x] HTTP security headers complete (incl. CSP)
+- [x] S3 buckets: block-all, SSL-only, encrypted, lifecycle rules
+- [x] Cognito MFA off documented with production-enable instructions
+- [x] `RemovalPolicy.DESTROY` documented as sandbox default with RETAIN guidance
+- [x] 242/242 tests pass
+- [x] `tsc --noEmit` + `infra:check` + `cdk synth` clean

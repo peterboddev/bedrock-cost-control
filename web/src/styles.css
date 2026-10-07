@@ -1,0 +1,75 @@
+:root {
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  color: #1a1a1a;
+  background: #f6f7f9;
+  /* Declare a light color scheme at the document root. This is what Chromium/
+     Edge use to render NATIVE form-control popups (the open <select> option
+     list). Without it, on a Windows dark-mode system the popup paints light
+     text on a light background and the options "blend" / become invisible. */
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+.app { max-width: 920px; margin: 0 auto; padding: 24px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.sub { color: #666; font-size: 13px; margin: 0 0 20px; }
+.card {
+  background: #fff; border: 1px solid #e4e6eb; border-radius: 10px;
+  padding: 16px 18px; margin-bottom: 18px;
+}
+.card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #555; margin: 0 0 12px; }
+label { display: block; font-size: 12px; color: #555; margin: 8px 0 2px; }
+input, select {
+  width: 100%; padding: 8px 10px; border: 1px solid #cfd3da; border-radius: 6px;
+  font-size: 14px; background: #fff; color: #1a1a1a;
+}
+
+/* Custom dropdown (replaces native <select> where the native popup blends
+   into the page on some OS themes). Fully styled, so the open list always has
+   a clear border + shadow and readable rows. */
+.dd { position: relative; width: 100%; }
+.dd-button {
+  width: 100%; padding: 8px 10px; border: 1px solid #cfd3da; border-radius: 6px;
+  font-size: 14px; background: #fff; color: #1a1a1a; text-align: left;
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+}
+.dd-button:disabled { opacity: .5; cursor: default; }
+.dd-caret { color: #888; font-size: 11px; }
+.dd-menu {
+  position: absolute; z-index: 50; top: calc(100% + 4px); left: 0; right: 0;
+  max-height: 280px; overflow-y: auto;
+  background: #fff; border: 1px solid #b9bfc9; border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
+  padding: 4px;
+}
+.dd-option {
+  padding: 7px 9px; border-radius: 5px; font-size: 14px; color: #1a1a1a;
+  cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dd-option:hover { background: #f1f2f6; }
+.dd-option.selected { background: #ede9fe; color: #4423c9; font-weight: 600; }
+.dd-empty { padding: 8px 9px; color: #888; font-size: 13px; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; }
+.row > div { flex: 1; min-width: 160px; }
+button {
+  padding: 8px 14px; border: none; border-radius: 6px; background: #5a31f4; color: #fff;
+  font-size: 14px; cursor: pointer;
+}
+button.secondary { background: #e9ebf0; color: #333; }
+button:disabled { opacity: .5; cursor: default; }
+table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #eef0f3; font-size: 14px; }
+th { color: #666; font-weight: 600; font-size: 12px; text-transform: uppercase; }
+td input { width: 160px; }
+.msg { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-top: 12px; }
+.msg.ok { background: #e7f6ec; color: #0f6b32; }
+.msg.err { background: #fdecec; color: #a3242a; }
+.muted { color: #888; font-size: 12px; }
+.inline { display: flex; gap: 8px; align-items: flex-end; }
+.inline > div { flex: 1; }
+.badge { font-size: 11px; background: #eef; color: #44c; padding: 2px 6px; border-radius: 4px; }
+.topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 20px; }
+.topbar h1 { margin: 0 0 4px; }
+.topbar .sub { margin: 0; }
+.user { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+code { background: #eef0f3; padding: 1px 5px; border-radius: 4px; font-size: 12px; }

@@ -1,0 +1,26 @@
+{
+  "name": "bedrock-team-token-quota-ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal admin UI to set and modify per-team, per-model Bedrock token budgets.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@aws-amplify/ui-react": "6.15.7",
+    "aws-amplify": "6.22.1",
+    "aws4fetch": "1.0.20",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "@vitejs/plugin-react": "4.3.4",
+    "typescript": "5.4.5",
+    "vite": "5.4.11"
+  }
+}

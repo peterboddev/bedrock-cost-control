@@ -1,5 +1,11 @@
 import * as fc from 'fast-check';
-import { listRolesForTeam, resolveTeam } from './teamRoleCache';
+import {
+  cacheRoleTeam,
+  listDiscoveredTeams,
+  listRolesForTeam,
+  listTeamRoleMappings,
+  resolveTeam,
+} from './teamRoleCache';
 import * as dynamoDbClient from './clients/dynamoDbClient';
 import * as iamClient from './clients/iamClient';
 import { UNMAPPED_ROLE } from './types';
@@ -515,5 +521,87 @@ describe('listRolesForTeam', () => {
       PK: `ROLE#${ROLE_ARN}`,
       team: 'teamA',
     });
+  });
+});
+
+describe('cacheRoleTeam - RoleListIndex projection', () => {
+  beforeEach(() => {
+    mockedPutItem.mockReset().mockResolvedValue({});
+  });
+
+  it('writes the constant roleListPk so the item appears in RoleListIndex', async () => {
+    await cacheRoleTeam(ROLE_ARN, 'teamZ', { tableName: TABLE_NAME });
+    expect(mockedPutItem).toHaveBeenCalledTimes(1);
+    expect(mockedPutItem.mock.calls[0][0].Item).toMatchObject({
+      PK: `ROLE#${ROLE_ARN}`,
+      team: 'teamZ',
+      roleListPk: 'ROLE',
+    });
+  });
+});
+
+describe('listTeamRoleMappings', () => {
+  beforeEach(() => {
+    mockedQuery.mockReset();
+  });
+
+  it('queries the RoleListIndex constant partition (never a Scan) and maps PK->roleArn', async () => {
+    mockedQuery.mockResolvedValueOnce({
+      Items: [
+        { PK: 'ROLE#arn:aws:iam::1:role/A', team: 'alpha' },
+        { PK: 'ROLE#arn:aws:iam::1:role/B', team: 'beta' },
+      ],
+    });
+
+    const result = await listTeamRoleMappings({ tableName: TABLE_NAME });
+
+    const q = mockedQuery.mock.calls[0][0];
+    expect(q.IndexName).toBe('RoleListIndex');
+    expect(q.KeyConditionExpression).toBe('roleListPk = :pk');
+    expect(q.ExpressionAttributeValues).toEqual({ ':pk': 'ROLE' });
+    expect(result).toEqual([
+      { roleArn: 'arn:aws:iam::1:role/A', team: 'alpha' },
+      { roleArn: 'arn:aws:iam::1:role/B', team: 'beta' },
+    ]);
+  });
+
+  it('follows LastEvaluatedKey across pages', async () => {
+    mockedQuery
+      .mockResolvedValueOnce({
+        Items: [{ PK: 'ROLE#arn:aws:iam::1:role/A', team: 'alpha' }],
+        LastEvaluatedKey: { roleListPk: 'ROLE', team: 'alpha' },
+      })
+      .mockResolvedValueOnce({
+        Items: [{ PK: 'ROLE#arn:aws:iam::1:role/B', team: 'beta' }],
+      });
+
+    const result = await listTeamRoleMappings({ tableName: TABLE_NAME });
+
+    expect(mockedQuery).toHaveBeenCalledTimes(2);
+    expect(result.map((m) => m.roleArn)).toEqual([
+      'arn:aws:iam::1:role/A',
+      'arn:aws:iam::1:role/B',
+    ]);
+  });
+});
+
+describe('listDiscoveredTeams', () => {
+  beforeEach(() => {
+    mockedQuery.mockReset();
+  });
+
+  it('returns the distinct teams, deduped and sorted', async () => {
+    mockedQuery.mockResolvedValueOnce({
+      Items: [
+        { PK: 'ROLE#arn:aws:iam::1:role/A', team: 'gamma' },
+        { PK: 'ROLE#arn:aws:iam::1:role/B', team: 'alpha' },
+        { PK: 'ROLE#arn:aws:iam::1:role/C', team: 'gamma' },
+        { PK: 'ROLE#arn:aws:iam::1:role/D', team: 'beta' },
+      ],
+    });
+
+    const result = await listDiscoveredTeams({ tableName: TABLE_NAME });
+
+    expect(result).toEqual(['alpha', 'beta', 'gamma']);
   });
 });
