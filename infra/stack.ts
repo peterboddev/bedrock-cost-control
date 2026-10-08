@@ -1676,13 +1676,19 @@ export class BedrockTeamTokenQuotaStack extends Stack {
     //   provides actual billed dollars from the AWS bill.
     //
     // Prerequisites (external, not created by this stack):
-    //   - A CUR 2.0 Data Export targeting S3 + Glue (AWS Data Exports).
-    //   - The `team` IAM tag activated as a cost-allocation tag.
+    //   - A CUR 2.0 Data Export with INCLUDE_IAM_PRINCIPAL_DATA, plus a Glue
+    //     table over it (AWS Data Exports does not create one).
+    //   - The IAM-principal tag activated as the cost-allocation tag
+    //     `iamPrincipal/<teamTagKey>` (e.g. `iamPrincipal/team`).
     //   - Athena access to the CUR Glue table.
+    //
+    // When QuickSight is also enabled, billed dollars are shown on the same
+    // dashboards as token usage and enforcement (a "Billed Cost" sheet).
     // -----------------------------------------------------------------
+    let curTeamCostGlueTable: CfnTable | undefined;
     if (props.curDatabaseName && props.curTableName) {
       // CUR Per-Team Cost Lambda: queries CUR 2.0 for Bedrock billed dollars
-      // per team (via the `team` cost-allocation tag) and writes them to the
+      // per team (via the `iamPrincipal/team` cost-allocation tag) and writes them to the
       // analytics bucket under cur-team-cost/ for QuickSight. This is the only
       // source of dollar-denominated cost in the system — the token pipeline
       // handles enforcement, CUR handles cost.
@@ -1749,7 +1755,7 @@ export class BedrockTeamTokenQuotaStack extends Stack {
       });
 
       // Glue table over the CUR per-team cost export (QuickSight cost view).
-      const curTeamCostGlueTable = new CfnTable(this, "CurTeamCostGlueTable", {
+      curTeamCostGlueTable = new CfnTable(this, "CurTeamCostGlueTable", {
         catalogId: this.account,
         databaseName: "bedrock_team_token_quota",
         tableInput: {
@@ -1925,6 +1931,164 @@ export class BedrockTeamTokenQuotaStack extends Stack {
         permissions: [{ principal: qsPrincipal, actions: dataSetActions }],
       });
 
+      // -----------------------------------------------------------------
+      // Billed-cost datasets (only when the CUR integration is enabled).
+      //
+      // The CUR Lambda writes MONTH-TO-DATE totals into every day's
+      // cur-team-cost/dt=<day>/ partition, so summing across partitions would
+      // double-count. These datasets therefore read only the LATEST partition
+      // that actually has rows. The inner query references a data column
+      // (team) so Athena scans real data instead of answering max(dt) from
+      // partition-projection metadata (which always returns today), and it is
+      // bounded to the last 14 days to avoid listing every projected day.
+      // The dashboard therefore shows the current billing period.
+      // -----------------------------------------------------------------
+      const costSql =
+        "SELECT team, model, endpoint, billedcost, totaltokens, currency, billingperiod " +
+        "FROM bedrock_team_token_quota.cur_team_cost " +
+        "WHERE dt >= date_format(date_add('day', -14, current_date), '%Y-%m-%d') " +
+        "AND dt = (SELECT max(dt) FROM bedrock_team_token_quota.cur_team_cost " +
+        "WHERE team IS NOT NULL AND dt >= date_format(date_add('day', -14, current_date), '%Y-%m-%d'))";
+      const costColumns = [
+        { name: "team", type: "STRING" },
+        { name: "model", type: "STRING" },
+        { name: "endpoint", type: "STRING" },
+        { name: "billedcost", type: "DECIMAL" },
+        { name: "totaltokens", type: "INTEGER" },
+        { name: "currency", type: "STRING" },
+        { name: "billingperiod", type: "STRING" },
+      ];
+      const buildCostDataSet = (
+        constructId: string,
+        dataSetId: string,
+        name: string,
+        withRls: boolean
+      ): QuickSightDataSet => {
+        const ds = new QuickSightDataSet(this, constructId, {
+          awsAccountId: this.account,
+          dataSetId,
+          name,
+          importMode: "DIRECT_QUERY",
+          physicalTableMap: {
+            billedCost: {
+              customSql: {
+                dataSourceArn: dataSource.attrArn,
+                name: "billed_cost_latest",
+                sqlQuery: costSql,
+                columns: costColumns,
+              },
+            },
+          },
+          // Team copy: same per-team RLS as the token dataset. Admin copy: none.
+          ...(withRls
+            ? {
+                rowLevelPermissionDataSet: {
+                  arn: rlsDataSet.attrArn,
+                  permissionPolicy: "GRANT_ACCESS",
+                  formatVersion: "VERSION_1",
+                },
+              }
+            : {}),
+          permissions: [{ principal: qsPrincipal, actions: dataSetActions }],
+        });
+        // The table must exist (and Athena must be able to resolve it) first.
+        if (curTeamCostGlueTable) ds.node.addDependency(curTeamCostGlueTable);
+        return ds;
+      };
+      const costEnabled = curTeamCostGlueTable !== undefined;
+      const teamCostDataSet = costEnabled
+        ? buildCostDataSet("BilledCostDataSet", "bedrock-team-token-quota-billed-cost", "Billed Cost by Team", true)
+        : undefined;
+      const adminCostDataSet = costEnabled
+        ? buildCostDataSet(
+            "BilledCostAdminDataSet",
+            "bedrock-team-token-quota-billed-cost-admin",
+            "Billed Cost (All Teams - admin)",
+            false
+          )
+        : undefined;
+
+      // One "Billed Cost" sheet appended to each dashboard so dollars sit next
+      // to tokens (and, for admins, enforcement) in the same place.
+      const buildCostSheet = (
+        sheetId: string,
+        ds: string,
+        visualPrefix: string,
+        withChart: boolean
+      ): QuickSightDashboard.SheetDefinitionProperty => ({
+        sheetId,
+        name: "Billed Cost",
+        visuals: [
+          ...(withChart
+            ? [
+                {
+                  barChartVisual: {
+                    visualId: `${visualPrefix}CostByTeam`,
+                    title: {
+                      visibility: "VISIBLE",
+                      formatText: { plainText: "Billed Cost by Team (USD, current billing period)" },
+                    },
+                    chartConfiguration: {
+                      fieldWells: {
+                        barChartAggregatedFieldWells: {
+                          category: [
+                            { categoricalDimensionField: { fieldId: "c_team", column: { dataSetIdentifier: ds, columnName: "team" } } },
+                          ],
+                          values: [
+                            {
+                              numericalMeasureField: {
+                                fieldId: "c_cost",
+                                column: { dataSetIdentifier: ds, columnName: "billedcost" },
+                                aggregationFunction: { simpleNumericalAggregation: "SUM" },
+                              },
+                            },
+                          ],
+                        },
+                      },
+                    },
+                  },
+                },
+              ]
+            : []),
+          {
+            tableVisual: {
+              visualId: `${visualPrefix}CostTable`,
+              title: {
+                visibility: "VISIBLE",
+                formatText: { plainText: "Billed Cost by Team, Model and Endpoint (USD, from AWS CUR)" },
+              },
+              chartConfiguration: {
+                fieldWells: {
+                  tableAggregatedFieldWells: {
+                    groupBy: [
+                      { categoricalDimensionField: { fieldId: "t_team", column: { dataSetIdentifier: ds, columnName: "team" } } },
+                      { categoricalDimensionField: { fieldId: "t_model", column: { dataSetIdentifier: ds, columnName: "model" } } },
+                      { categoricalDimensionField: { fieldId: "t_endpoint", column: { dataSetIdentifier: ds, columnName: "endpoint" } } },
+                    ],
+                    values: [
+                      {
+                        numericalMeasureField: {
+                          fieldId: "t_cost",
+                          column: { dataSetIdentifier: ds, columnName: "billedcost" },
+                          aggregationFunction: { simpleNumericalAggregation: "SUM" },
+                        },
+                      },
+                      {
+                        numericalMeasureField: {
+                          fieldId: "t_tokens",
+                          column: { dataSetIdentifier: ds, columnName: "totaltokens" },
+                          aggregationFunction: { simpleNumericalAggregation: "SUM" },
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          },
+        ],
+      });
+
       // Dashboard: a single "Cost Overview" sheet with a table of cost by
       // team/model/endpoint. RLS on the dataset ensures each viewer sees only
       // their own team's rows.
@@ -1935,6 +2099,7 @@ export class BedrockTeamTokenQuotaStack extends Stack {
         definition: {
           dataSetIdentifierDeclarations: [
             { identifier: "usageCost", dataSetArn: mainDataSet.attrArn },
+            ...(teamCostDataSet ? [{ identifier: "billedCost", dataSetArn: teamCostDataSet.attrArn }] : []),
           ],
           sheets: [
             {
@@ -1972,6 +2137,7 @@ export class BedrockTeamTokenQuotaStack extends Stack {
                 },
               ],
             },
+            ...(teamCostDataSet ? [buildCostSheet("team-billed-cost", "billedCost", "team", false)] : []),
           ],
         },
         permissions: [
@@ -2089,6 +2255,7 @@ export class BedrockTeamTokenQuotaStack extends Stack {
             { identifier: "usageCostAdmin", dataSetArn: adminDataSet.attrArn },
             { identifier: "blockedState", dataSetArn: blockedStateDataSet.attrArn },
             { identifier: "enforcementAudit", dataSetArn: enforcementAuditDataSet.attrArn },
+            ...(adminCostDataSet ? [{ identifier: "billedCostAdmin", dataSetArn: adminCostDataSet.attrArn }] : []),
           ],
           sheets: [
             {
@@ -2215,6 +2382,7 @@ export class BedrockTeamTokenQuotaStack extends Stack {
                 },
               ],
             },
+            ...(adminCostDataSet ? [buildCostSheet("admin-billed-cost", "billedCostAdmin", "admin", true)] : []),
           ],
         },
         permissions: [

@@ -218,11 +218,17 @@ enabled for the model(s) you'll test (Bedrock console → Model access), and —
 you want dashboards — an existing **QuickSight** subscription with a user.
 
 **B. Start CUR enablement NOW (longest clock — do it first, then move on).**
-Only if you want the dollar-cost view. If your account already has a CUR 2.0
-export, skip this. Otherwise create it (full commands + bucket policy in
+Only if you want the dollar-cost view. Create the CUR bucket and export (full
+commands + bucket policy in
 [CUR 2.0 setup walkthrough](#cur-20-setup-walkthrough-one-time-per-account),
-Steps 1-2). This starts the ~24-48h AWS billing clock. Do **not** wait on it —
-continue to step C immediately.
+Steps 1-2). **The export must be created with IAM principal data
+(`INCLUDE_IAM_PRINCIPAL_DATA=TRUE`)** — the Step 2 commands do this; without it
+per-team dollars can never appear. If your account **already** has a CUR 2.0
+export, check it has that option:
+`aws bcm-data-exports get-export --region us-east-1 --export-arn <arn> --query "Export.DataQuery.TableConfigurations.COST_AND_USAGE_REPORT.INCLUDE_IAM_PRINCIPAL_DATA"`
+must print `TRUE`; if not, create a new export (see "Already created the
+export without IAM principal data?" in that walkthrough). This starts the AWS
+billing clock. Do **not** wait on it — continue to step C immediately.
 
 **C. Deploy the core stack.**
 
@@ -308,7 +314,8 @@ data-source connection test), then redeploy with the principal ARN (in
 QuickSight's **home region**, which may differ from the stack region):
 
 ```bash
-BUCKET=<AnalyticsExportBucket physical id from cdk-outputs>
+# The analytics bucket is NOT a stack output; find it by name prefix:
+BUCKET=$(aws s3 ls | awk '{print $3}' | grep analyticsexportbucket)
 aws iam put-role-policy --role-name aws-quicksight-service-role-v0 \
   --policy-name BedrockTeamTokenQuotaAnalyticsBucketAccess \
   --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[
@@ -335,8 +342,34 @@ dashboard means you haven't uploaded RLS rules yet — see "Two dashboards".)
 
 **I. Finish CUR — LATER (next day+), once AWS has caught up.** This is the step
 that lights up the **dollar** dashboard. **Steps A-H above are the whole
-same-day install — once you finish H, you are done for now. Stop here and come
-back later for step I.**
+same-day install.** After H, **try I.1 straight away** — it is a safe, idempotent
+command and also the "is it time yet?" gate. If the `iamPrincipal/team` key is
+already listed in your billing account it succeeds immediately (it did when we
+re-ran the README on an account that had used the tag before); if it errors
+"Tag keys not found", stop, wait, and come back later. Either way the remaining
+gates (billing posting your usage, the CUR delivering it) are waits of about a
+day.
+
+**The complete CUR order, start to finish** (this is the one sequence to
+follow; the "CUR 2.0 setup walkthrough" section further down holds the full
+commands for steps 1, 2 and 4 and is a reference, not a second procedure):
+
+1. **Step B (day 0)** — create the CUR bucket + export *with IAM principal data*
+   (walkthrough Steps 1-2).
+2. **Steps C-H (day 0)** — deploy and generate usage under `team`-tagged roles.
+3. **I.1 (day 1+)** — activate `iamPrincipal/team` (the command is just below).
+   **Retry until it succeeds** — failing with "Tag keys not found" means "not
+   yet", not "broken". When it succeeds, **generate usage again** (tags are not
+   retroactive).
+4. **⛔ Gate 1 — billing has the tag (Cost Explorer).** Run Check 1, then
+   Check 2, until Check 2 returns your team names for the post-activation usage
+   day. Usually about a day.
+5. **I.2** — create/refresh the Glue table (walkthrough Step 4), then
+   **⛔ Gate 2 — the CUR has it:** re-run the Athena query until it returns real
+   team names. (This waits on the CUR export delivering to S3, which is
+   separate from Gate 1.)
+6. **I.3 (only after Gate 2 passes)** — redeploy with the CUR table to light up
+   the dollar dashboard.
 
 Do the sub-steps strictly in order, and do **not** run the next one until its
 "wait here" check passes — each stage depends on AWS having propagated the
@@ -345,74 +378,92 @@ debug.
 
 ---
 
-**I.1 — Activate the `team` cost-allocation tag. This command is also the "is it
-time yet?" gate.** AWS only lets you activate a tag once billing has catalogued
-spend carrying it, so running this *is* how you find out whether the clock is
-done — there is no separate pre-check to run.
+**I.1 — Activate the `iamPrincipal/team` cost-allocation tag. This command is
+also the "is it time yet?" gate.**
+
+> **The key is `iamPrincipal/team`, NOT `team`.** Bedrock attributes cost to the
+> calling IAM principal, and billing lists IAM-principal tags under an
+> `iamPrincipal/` prefix. Activating the bare key `team` fails with "Tag keys not
+> found: team" forever (it is a different key) — verified live. Also confirm your
+> CUR export was created with `INCLUDE_IAM_PRINCIPAL_DATA` (CUR Step 2), or the
+> tag can never appear in CUR.
+>
+> **AWS Organizations:** AWS's guidance is that cost allocation tags are
+> activated in the **management (payer) account**; tagged usage from member
+> accounts then consolidates there. If your Bedrock account is a *member*
+> account, ask the management account's admin to run this activation. (Sources:
+> the [AWS Cost Management blog on IAM principal cost allocation](https://aws.amazon.com/blogs/aws-cloud-financial-management/track-amazon-bedrock-costs-by-caller-identity-with-iam-based-cost-allocation/)
+> and the [Architecture blog on Bedrock inference-profile cost tracking](https://aws.amazon.com/blogs/architecture/track-generative-ai-costs-with-amazon-bedrock-inference-profiles/).
+> The Bedrock user guide page itself does not state this. We verified activation
+> only from an account that *is* the management account; the member-account
+> case is unverified.)
 
 ```bash
 aws ce update-cost-allocation-tags-status --region us-east-1 \
-  --cost-allocation-tags-status '[{"TagKey":"team","Status":"Active"}]'
+  --cost-allocation-tags-status '[{"TagKey":"iamPrincipal/team","Status":"Active"}]'
 ```
 
-- **Errors with `ValidationException ... Tag keys not found: team`** → AWS has
-  not catalogued the `team` tag from your step-F usage yet. **This is expected,
-  not a misconfiguration. You are done for now — stop, wait a few hours
-  (typically ~24-48h after step F), and re-run this exact command later.**
-  Re-running it is the entire "are we there yet?" loop; nothing else to do until
-  it stops erroring.
-- **Succeeds (no error)** → the tag is now active. Proceed to I.2.
+- **Succeeds (no error / empty `Errors`)** → the tag is active. **Now generate
+  usage again** — re-run the step-F block
+  ([Step 1 — generate real Converse usage](#step-1--generate-real-converse-usage-per-team)).
+  AWS states cost allocation tags are **not retroactive: only costs incurred
+  after activation are tagged**, so the usage you generated *before* this point
+  will most likely show no `iamPrincipal/team` value in CUR. Usage generated
+  *after* activation will. Then go to **Gate 1** below.
+- **Errors with `ValidationException ... Tag keys not found: iamPrincipal/team`**
+  → billing has not yet listed that key. Per the AWS docs, an IAM-principal tag
+  only becomes available to activate after the tagged principal has made at
+  least one Bedrock call, then can take up to ~24h to appear. Make sure step F
+  ran under a role that carries the `team` tag, then wait and re-run this exact
+  command. Re-running it is the "are we there yet?" loop.
 
-> Verified live behavior: before the tag is catalogued, the CLI returns a
-> top-level `ValidationException` with message `Failed to update Cost Allocation
-> Tag: Tag keys not found: team` (not an empty success). The AWS API reference's
-> example shows this as a per-entry `TagKeysNotFoundException` in an `Errors`
-> array, but the CLI surfaces it as a `ValidationException` — either way it
-> means the same thing: not catalogued yet, wait and retry. See
-> [UpdateCostAllocationTagsStatus](https://docs.aws.amazon.com/aws-cost-management/latest/APIReference/API_UpdateCostAllocationTagsStatus.html)
-> and [Activating user-defined cost allocation tags](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/activating-tags.html)
-> (a user-defined tag can take up to ~24h to become available to activate, then
-> up to ~24h more to activate).
+> The CLI surfaces an unknown key as a top-level `ValidationException`; the AWS
+> API reference example shows a per-entry `TagKeysNotFoundException` in an
+> `Errors` array. Both mean "not listed yet". See
+> [UpdateCostAllocationTagsStatus](https://docs.aws.amazon.com/aws-cost-management/latest/APIReference/API_UpdateCostAllocationTagsStatus.html),
+> [Using IAM principal for cost allocation](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/iam-principal-cost-allocation.html)
+> and [Activating user-defined cost allocation tags](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/activating-tags.html).
 
-**If I.1 keeps erroring after a day+, diagnose *why* instead of just waiting.**
-"Tag keys not found" has one root cause: billing hasn't yet processed *billed
-Bedrock spend* carrying the `team` tag. A cost-allocation tag can only be
-catalogued once it rides on a posted line item — so the real precondition is
-"has AWS billed the Bedrock usage from step F yet?", not "has N hours passed."
-Two read-only checks pinpoint exactly where you are in the pipeline:
+**⛔ Gate 1 — has billing processed your Bedrock usage and seen the tag?** Use
+these two read-only checks in two situations: (a) **after I.1 succeeds**, to
+wait for the usage you generated *after* activation to be posted, and (b) if
+**I.1 keeps erroring** after a day or more, to see where billing is instead of
+just waiting. Set `<usage-day>` to the day you ran the usage:
 
 ```bash
 # Check 1 — has any Bedrock cost posted at all? Replace the dates with the days
-# spanning your step-F usage. $0 everywhere (and "Estimated": true) = billing
-# has not processed the spend yet; the tag CANNOT be catalogued until it does.
+# spanning your step-F usage. $0 on your usage day (and "Estimated": true) =
+# billing has not processed the spend yet; the tag CANNOT be catalogued until it
+# does. NOTE: Bedrock bills under TWO Cost Explorer service names — "Amazon
+# Bedrock" (Nova, Llama, gpt-oss, ...) and "Amazon Bedrock Service" (Anthropic
+# Claude). Filter on BOTH or you can read a false $0.
 aws ce get-cost-and-usage --region us-east-1 \
   --time-period Start=<usage-day> End=<usage-day+2> --granularity DAILY \
   --metrics UnblendedCost \
-  --filter '{"Dimensions":{"Key":"SERVICE","Values":["Amazon Bedrock"]}}'
+  --filter '{"Dimensions":{"Key":"SERVICE","Values":["Amazon Bedrock","Amazon Bedrock Service"]}}' \
+  --query "ResultsByTime[].[TimePeriod.Start,Total.UnblendedCost.Amount]" --output text
 
 # Check 2 — has billing seen the team tag VALUES on that spend? Returns [""]
 # (empty) until it has; returns your team names (alpha/beta/gamma) once it has.
-# The moment this returns real values, I.1 will succeed.
 aws ce get-tags --region us-east-1 \
-  --time-period Start=<usage-day> End=<usage-day+2> --tag-key team
+  --time-period Start=<usage-day> End=<usage-day+2> --tag-key "iamPrincipal/team"
 ```
 
 Interpretation:
-- **Check 1 is $0 / estimated** → nothing to fix. Bedrock billing lag (typically
-  up to ~24h *after the usage day closes*, sometimes longer). Wait and re-run I.1.
+- **Check 1 is $0 / estimated** → billing hasn't posted your usage day yet
+  (typically up to ~24h after the day closes, sometimes longer). Wait and re-run.
 - **Check 1 shows cost but Check 2 returns `[""]`** → cost posted but the tag
-  hasn't propagated to cost allocation yet; give it the documented extra window
-  (up to ~24h more). Re-run I.1.
-- **Check 2 returns your team names** → re-run I.1 now; it will succeed.
+  hasn't propagated yet; give it the documented extra window. Re-run.
+- **Check 2 returns your team names** → Gate 1 passed: billing has the tag on
+  your usage. If I.1 was still erroring, re-run it now (it will succeed);
+  otherwise proceed to I.2.
 
-This is the sharper version of the "are we there yet?" loop: Check 1 → Check 2 →
-I.1 succeeds. All three are safe to re-run as often as you like.
-
-Optional, after I.1 succeeds — confirm the activated status:
+Optional — confirm the activated status (any iamPrincipal/* tag your account has
+seen is listed; only the ones you activate show `Active`):
 
 ```bash
-aws ce list-cost-allocation-tags --region us-east-1 \
-  --query "CostAllocationTags[?TagKey=='team'].{Tag:TagKey,Status:Status}" --output table
+aws ce list-cost-allocation-tags --region us-east-1 --tag-keys "iamPrincipal/team" \
+  --query "CostAllocationTags[].{Tag:TagKey,Status:Status}" --output table
 ```
 
 ---
@@ -423,10 +474,13 @@ one for CUR 2.0 Data Exports — you create it with a crawler (full commands und
 step 4). Result: `CUR_DATABASE_NAME=cur2_db`, `CUR_TABLE_NAME=data`, cataloged in the
 **stack** region over the us-east-1 CUR S3 data (cross-region read verified).
 
-**⛔ WAIT HERE until this check returns real team names.** CUR 2.0 nests tags
-into a single `resource_tags` **map** column; the `user:team` key only appears
-on line items billed *after* I.1 succeeded, so expect **another ~24h lag even
-after I.1 shows Active**. Re-run this query until it returns non-blank teams:
+**⛔ Gate 2 — WAIT HERE until this check returns real team names.** Do this
+after Gate 1 passes. CUR 2.0 puts IAM-principal tags in the `tags` **map**
+column under the key `iamPrincipal/team`, and only on line items for usage
+*after* I.1 succeeded. Even once billing has the tag (Gate 1), the CUR export
+must still deliver a new file to S3 on its own schedule (on our account it had
+not refreshed for about a day), so this can lag Gate 1. Re-run this query until
+it returns non-blank teams:
 
 ```bash
 BUCKET=<AnalyticsExportBucket id>   # for Athena results
@@ -434,9 +488,9 @@ aws athena start-query-execution --region "$AWS_REGION" \
   --work-group bedrock-team-token-quota \
   --query-execution-context Database=cur2_db \
   --result-configuration "OutputLocation=s3://$BUCKET/athena-results/" \
-  --query-string "SELECT DISTINCT resource_tags['user:team'] AS team
+  --query-string "SELECT DISTINCT tags['iamPrincipal/team'] AS team
                   FROM cur2_db.data
-                  WHERE line_item_product_code = 'AmazonBedrock'"
+                  WHERE line_item_product_code IN ('AmazonBedrock', 'AmazonBedrockService')"
 # ...then read the result:
 #   aws athena get-query-results --query-execution-id <id> \
 #     --query 'ResultSet.Rows[].Data[].VarCharValue' --output text
@@ -446,15 +500,24 @@ aws athena start-query-execution --region "$AWS_REGION" \
 # Real team names     → the column has landed → proceed to I.3.
 ```
 
-> If the query errors with **"Column 'resource_tags' cannot be resolved"**, the
-> Glue table hasn't been (re)crawled since the column appeared — re-run the CUR
+> **Two Bedrock product codes.** Bedrock bills under both `AmazonBedrock`
+> (Nova, Llama, gpt-oss, ...) and `AmazonBedrockService` (Anthropic Claude,
+> including Mantle-served Claude). Verified on a live CUR 2.0 export: Claude was
+> ~99% of the dollars, so a filter on `AmazonBedrock` alone silently drops most
+> of the cost. The stack's `CurTeamCost` Lambda query matches both.
+> To see what your own CUR contains:
+> `SELECT line_item_product_code, line_item_usage_type, SUM(line_item_unblended_cost) FROM cur2_db.data WHERE lower(line_item_product_code) LIKE '%bedrock%' GROUP BY 1,2`
+
+> If the query errors with **"Column 'tags' cannot be resolved"**, the Glue
+> table doesn't have the column (e.g. it was crawled before the export changed).
+> Re-run the CUR
 > crawler ([CUR 2.0 setup walkthrough](#cur-20-setup-walkthrough-one-time-per-account),
 > step 4 / I.2) so Glue picks up the new schema, then re-run the check.
 
 ---
 
-**I.3 — Redeploy pointed at the CUR table.** Only do this once I.2's check
-returns real team names. This creates the CUR cost Lambda + `cur_team_cost`
+**I.3 — Redeploy pointed at the CUR table.** Only do this once Gate 2 (I.2's
+Athena check) returns real team names. This creates the CUR cost Lambda + `cur_team_cost`
 table + dollar dashboard:
 
 ```bash
@@ -464,7 +527,7 @@ npx cdk deploy --require-approval never --outputs-file cdk-outputs.json
 ```
 
 *Confirm:* the dollar dashboard populates on its next refresh. Under the hood
-the `CurTeamCost` Lambda runs the same `resource_tags['user:team']` query you
+the `CurTeamCost` Lambda runs the same `tags['iamPrincipal/team']` query you
 just validated (`buildPerTeamCostQuery`), so if I.2's check returned real teams,
 the dashboard will too.
 
@@ -732,7 +795,7 @@ aws athena delete-work-group --work-group bedrock-team-token-quota --recursive-d
 ```bash
 # TEST_ROLE_TRUSTED_PRINCIPAL_ARNS must still be set (the app reads it on synth).
 export TEST_ROLE_TRUSTED_PRINCIPAL_ARNS="arn:aws:iam::$ACCOUNT_ID:user/<your-username>"
-npx cdk destroy
+npx cdk destroy --force    # --force skips the interactive y/n prompt (needed in scripts)
 ```
 
 This removes everything the stack created: all DynamoDB tables (**and their
@@ -783,7 +846,14 @@ aws s3api delete-bucket --bucket "$CUR_BUCKET" --region us-east-1 2>/dev/null ||
 # Optional: deactivate the team cost-allocation tag (ignore "Tag keys not
 # found" — that just means it never activated).
 aws ce update-cost-allocation-tags-status --region us-east-1 \
-  --cost-allocation-tags-status '[{"TagKey":"team","Status":"Inactive"}]' 2>/dev/null || true
+  --cost-allocation-tags-status '[{"TagKey":"iamPrincipal/team","Status":"Inactive"}]' 2>/dev/null || true
+
+# 3b. The CUR Glue catalog objects from CUR Step 4 (also outside the stack):
+aws glue delete-crawler --region "$AWS_REGION" --name bedrock-cur2-crawler 2>/dev/null || true
+aws glue delete-database --region "$AWS_REGION" --name cur2_db 2>/dev/null || true
+aws iam delete-role-policy --role-name BedrockCur2CrawlerRole --policy-name CurS3Read 2>/dev/null || true
+aws iam detach-role-policy --role-name BedrockCur2CrawlerRole --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole 2>/dev/null || true
+aws iam delete-role --role-name BedrockCur2CrawlerRole 2>/dev/null || true
 
 # 4. Watch for ORPHANED buckets from earlier stack versions. A stack
 #    replacement can leave old model-invocation-log buckets behind (they match
@@ -1513,8 +1583,8 @@ one place, because CUR touches several accounts-level resources this stack does
 |---|---|---|---|
 | CUR 2.0 export definition | **You** (one-time, §setup below) | `us-east-1` (BCM Data Exports is us-east-1-only) | your account |
 | CUR data (Parquet files) | AWS Billing, on a schedule | the **CUR S3 bucket** you create (e.g. `bedrock-cur2-export-<acct>`), `us-east-1` | your account |
-| Glue database + table over the CUR | AWS Data Exports, automatically after first delivery (~24h) | AWS Glue Data Catalog, `us-east-1` | your account |
-| `team` cost-allocation tag activation | **You** (one-time) | AWS Billing | your account |
+| Glue database + table over the CUR | **You** (one-time, via a Glue crawler — AWS does **not** create it for CUR 2.0; see CUR Step 4) | AWS Glue Data Catalog, your stack's region | your account |
+| `iamPrincipal/team` cost-allocation tag activation | **You** (one-time) | AWS Billing | your account |
 | The per-team cost **Lambda** + its reads | **this stack** (opt-in) | the stack's region | this stack |
 | The derived `cur-team-cost/` output | this stack's Lambda | the stack's **analytics bucket** | this stack |
 
@@ -1559,8 +1629,8 @@ When `curDatabaseName` + `curTableName` are set, the stack deploys one
 scheduled Lambda (every 6 hours):
 
 - **CUR Per-Team Cost** — queries CUR 2.0 via Athena for Bedrock billed cost
-  per team (grouped by model and endpoint), using the `team` cost-allocation
-  tag, and writes the result to `s3://<analyticsBucket>/cur-team-cost/dt=<day>/`.
+  per team (grouped by model and endpoint), using the `iamPrincipal/team`
+  cost-allocation tag, and writes the result to `s3://<analyticsBucket>/cur-team-cost/dt=<day>/`.
   A Glue table (`cur_team_cost`) is created over it, so a QuickSight dataset /
   visual can show **AWS-billed dollars per team** directly.
 
@@ -1581,15 +1651,16 @@ this solution**:
 - **You do not wait on CUR to use the product.** Token tracking, quota
   enforcement, and the token-usage dashboards all work the moment the core
   stack is deployed. CUR adds only the *dollar* view.
-- **Do these in parallel.** Kick off the CUR setup below (it has a ~24h
+- **Do these in parallel.** Do Steps 1-2 below first (the export has a
   first-delivery lag that is entirely AWS-side), and meanwhile deploy the
-  solution and start using it. When CUR data lands (~24h later), do a one-line
-  redeploy with the Glue table name (step 4) and the dollar view lights up.
-- Because the tag activation (step 3) requires billing to have already
-  *processed* spend under `team`-tagged roles, the realistic cold-start for the
-  dollar view is **~1-3 days** on a brand-new account — again, all AWS-side
-  waiting, not solution setup. On an account that already has CUR + the tag
-  active, it's effectively immediate (just step 4).
+  solution and start using it. **The order to follow, with the wait gates, is
+  step I of the [A-Z walkthrough](#full-deploy-and-test-walkthrough-a-z-in-order)**
+  — this section just holds the commands for Steps 1, 2 and 4.
+- Because the tag activation (step I.1) requires billing to have already seen a
+  Bedrock call from a `team`-tagged role, the realistic cold-start for the
+  dollar view is **~1-3 days** on a brand-new account — all AWS-side waiting,
+  not solution setup. On an account that already has CUR + the tag active, it's
+  effectively immediate (just Step 4 and the redeploy).
 
 The steps below are the exact CLI (the same can be done in the AWS Billing
 console). This stack does **not** create the CUR export — you own it.
@@ -1632,8 +1703,12 @@ For the bucket policy specification, see
 **Step 2 — Create the CUR 2.0 Data Export:**
 
 ```bash
-# Get all CUR 2.0 column names (builds the SELECT query automatically)
+# Get all CUR 2.0 column names (builds the SELECT query automatically).
+# --table-properties INCLUDE_IAM_PRINCIPAL_DATA=TRUE is REQUIRED: without it the
+# column list omits line_item_iam_principal (115 columns vs 116), and the export
+# cannot carry per-team data for Bedrock.
 COLS=$(aws bcm-data-exports get-table --table-name COST_AND_USAGE_REPORT \
+  --table-properties INCLUDE_IAM_PRINCIPAL_DATA=TRUE \
   --query "Schema[].Name" --output text --region us-east-1)
 SELECT_ALL=$(echo "$COLS" | tr '\t' ',')
 
@@ -1652,7 +1727,8 @@ print(json.dumps({
         'TIME_GRANULARITY': 'DAILY',
         'INCLUDE_RESOURCES': 'TRUE',
         'INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY': 'FALSE',
-        'INCLUDE_SPLIT_COST_ALLOCATION_DATA': 'FALSE'
+        'INCLUDE_SPLIT_COST_ALLOCATION_DATA': 'FALSE',
+        'INCLUDE_IAM_PRINCIPAL_DATA': 'TRUE'
       }
     }
   },
@@ -1675,21 +1751,20 @@ aws bcm-data-exports create-export --export "file:///tmp/cur-export.json" --regi
 For full details, see
 [Creating a CUR 2.0 export](https://docs.aws.amazon.com/cur/latest/userguide/data-exports-migrate-two.html)
 and
-[Using IAM principal for cost allocation](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-mgmt-iam-principal.html).
+[Using IAM principal for cost allocation](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/iam-principal-cost-allocation.html).
 
-**Step 3 — Activate the `team` tag as a cost-allocation tag:**
+**Already created the export without IAM principal data?** AWS's
+[IAM principal attribution](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-mgmt-iam-principal-tracking.html)
+page says to **create a new export** with the caller-identity option: existing
+exports do not retroactively include identity data. Re-run Step 2 above to create
+a new export (with a new name and `S3Prefix`), then point the Glue crawler at
+that prefix.
 
-```bash
-aws ce update-cost-allocation-tags-status --region us-east-1 \
-  --cost-allocation-tags-status '[{"TagKey":"team","Status":"Active"}]'
-```
-
-> **Note:** The `team` tag only appears in the cost-allocation catalog after
-> billing has processed usage from roles tagged with `team`. If the command
-> fails with "Tag keys not found: team", that means no billing data with that
-> tag has been processed yet. Wait ~24-48h after your first Bedrock calls
-> under a team-tagged role, then retry. Once activated, allow another ~24h for
-> the tag to start populating CUR.
+**Step 3 — Activate the `iamPrincipal/team` cost-allocation tag.** This is
+**step I.1** of the A-Z walkthrough — the command, the retry logic and the
+caveats (prefixed key, Organizations, not retroactive) live there so there is
+exactly one copy. Don't run it here: it fails until your tagged roles have made
+a Bedrock call.
 
 For background, see
 [Activating user-defined cost allocation tags](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/activating-tags.html)
@@ -1752,13 +1827,13 @@ export CUR_TABLE_NAME="data"
 npm run infra:deploy
 ```
 
-> **Per-team dollars still wait on the `team` tag (Step 3).** Even with the Glue
-> table and the redeploy done, the CUR cost Lambda groups cost by the
-> `resource_tags_user_team` column — which CUR only adds **after** the `team`
-> cost-allocation tag is activated and billing reprocesses (~24-48h). Until
-> then the pipeline is wired correctly but the per-team cost visual is empty.
-> (Verified live: Bedrock line items were present in CUR within the hour, but no
-> `team` tag column existed yet — that is the genuine AWS-side wait.)
+> **Per-team dollars still wait on the `iamPrincipal/team` tag (step I.1).** Even
+> with the Glue table and the redeploy done, the CUR cost Lambda groups cost by
+> `tags['iamPrincipal/team']` — which CUR only populates **after** the tag is
+> activated (step I.1) and billing processes usage under it (~24-48h). Until then
+> the pipeline is wired correctly but the per-team cost visual is empty.
+> (Verified live: Bedrock line items were present in CUR within the hour, with
+> no tag keys on them yet.)
 
 Omit `CUR_DATABASE_NAME` / `CUR_TABLE_NAME` and the stack skips the CUR cost
 Lambda entirely — token tracking and enforcement still work fully; only the
@@ -1881,11 +1956,12 @@ in `Usage_Aggregation` as per-team rows (verify in Step 3). The **dollar** cost
 for the same calls appears later, once CUR 2.0 is active and has delivered
 (~24h) — see the CUR note below.
 
-> **The `team` cost-allocation tag can only be activated *after* this usage.**
-> AWS only lists a tag as cost-allocatable once billing has processed spend
-> carrying it. So the order is always: generate team-tagged usage (this step)
-> → wait ~24-48h → activate the `team` tag (CUR §Step 3) → wait ~24h for CUR to
-> populate. The token dashboards, by contrast, show this usage within minutes.
+> **The `iamPrincipal/team` cost-allocation tag is activated *after* this usage.**
+> Per the AWS docs, an IAM-principal tag only becomes available to activate once
+> the tagged role has made a Bedrock call. So the order is: generate
+> team-tagged usage (this step) → activate `iamPrincipal/team` (step I.1;
+> retry if it isn't listed yet) → wait for CUR to populate. The token
+> dashboards, by contrast, show this usage within minutes.
 
 ### Step 2 — generate Mantle usage (if your account/region has Mantle)
 
