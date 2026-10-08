@@ -374,8 +374,41 @@ aws ce update-cost-allocation-tags-status --region us-east-1 \
 > (a user-defined tag can take up to ~24h to become available to activate, then
 > up to ~24h more to activate).
 
-Optional: confirm the status afterward (shows `Active` once the command above
-succeeded):
+**If I.1 keeps erroring after a day+, diagnose *why* instead of just waiting.**
+"Tag keys not found" has one root cause: billing hasn't yet processed *billed
+Bedrock spend* carrying the `team` tag. A cost-allocation tag can only be
+catalogued once it rides on a posted line item — so the real precondition is
+"has AWS billed the Bedrock usage from step F yet?", not "has N hours passed."
+Two read-only checks pinpoint exactly where you are in the pipeline:
+
+```bash
+# Check 1 — has any Bedrock cost posted at all? Replace the dates with the days
+# spanning your step-F usage. $0 everywhere (and "Estimated": true) = billing
+# has not processed the spend yet; the tag CANNOT be catalogued until it does.
+aws ce get-cost-and-usage --region us-east-1 \
+  --time-period Start=<usage-day> End=<usage-day+2> --granularity DAILY \
+  --metrics UnblendedCost \
+  --filter '{"Dimensions":{"Key":"SERVICE","Values":["Amazon Bedrock"]}}'
+
+# Check 2 — has billing seen the team tag VALUES on that spend? Returns [""]
+# (empty) until it has; returns your team names (alpha/beta/gamma) once it has.
+# The moment this returns real values, I.1 will succeed.
+aws ce get-tags --region us-east-1 \
+  --time-period Start=<usage-day> End=<usage-day+2> --tag-key team
+```
+
+Interpretation:
+- **Check 1 is $0 / estimated** → nothing to fix. Bedrock billing lag (typically
+  up to ~24h *after the usage day closes*, sometimes longer). Wait and re-run I.1.
+- **Check 1 shows cost but Check 2 returns `[""]`** → cost posted but the tag
+  hasn't propagated to cost allocation yet; give it the documented extra window
+  (up to ~24h more). Re-run I.1.
+- **Check 2 returns your team names** → re-run I.1 now; it will succeed.
+
+This is the sharper version of the "are we there yet?" loop: Check 1 → Check 2 →
+I.1 succeeds. All three are safe to re-run as often as you like.
+
+Optional, after I.1 succeeds — confirm the activated status:
 
 ```bash
 aws ce list-cost-allocation-tags --region us-east-1 \
