@@ -196,6 +196,15 @@ export interface BedrockTeamTokenQuotaStackProps extends StackProps {
   readonly curDatabaseName?: string;
   /** CUR 2.0 Glue table name within `curDatabaseName`. */
   readonly curTableName?: string;
+  /**
+   * Name of the S3 bucket the CUR 2.0 export delivers to. REQUIRED when
+   * `curDatabaseName` + `curTableName` are set: Athena reads the CUR Parquet
+   * with the cost Lambda's own credentials, so the Lambda's role must be
+   * granted read on this bucket (the stack cannot discover it from the Glue
+   * table at synth time). Without it the Lambda fails with
+   * "not authorized to perform: s3:ListBucket".
+   */
+  readonly curBucketName?: string;
 }
 
 export class BedrockTeamTokenQuotaStack extends Stack {
@@ -1687,6 +1696,16 @@ export class BedrockTeamTokenQuotaStack extends Stack {
     // -----------------------------------------------------------------
     let curTeamCostGlueTable: CfnTable | undefined;
     if (props.curDatabaseName && props.curTableName) {
+      // Fail fast at synth rather than at runtime: Athena reads the CUR files
+      // with the Lambda's credentials, which need read on the CUR bucket.
+      if (!props.curBucketName) {
+        throw new Error(
+          "CUR integration is enabled (CUR_DATABASE_NAME + CUR_TABLE_NAME) but CUR_BUCKET_NAME is not set. " +
+            "Set CUR_BUCKET_NAME to the S3 bucket your CUR 2.0 export delivers to " +
+            "(e.g. bedrock-cur2-export-<account-id>) so the cost Lambda can read it."
+        );
+      }
+      const curBucketName = props.curBucketName;
       // CUR Per-Team Cost Lambda: queries CUR 2.0 for Bedrock billed dollars
       // per team (via the `iamPrincipal/team` cost-allocation tag) and writes them to the
       // analytics bucket under cur-team-cost/ for QuickSight. This is the only
@@ -1746,6 +1765,20 @@ export class BedrockTeamTokenQuotaStack extends Stack {
             `${analyticsBucket.bucketArn}`,
             `${analyticsBucket.bucketArn}/athena-results/*`,
             `${analyticsBucket.bucketArn}/cur-team-cost/*`,
+          ],
+        })
+      );
+      // S3: read the CUR export files themselves. Athena uses the caller's
+      // credentials for the data files, so without this the query fails with
+      // "not authorized to perform: s3:ListBucket" on the CUR bucket.
+      curTeamCostFunction.addToRolePolicy(
+        new PolicyStatement({
+          sid: "ReadCurExportBucket",
+          effect: Effect.ALLOW,
+          actions: ["s3:GetObject", "s3:GetBucketLocation", "s3:ListBucket"],
+          resources: [
+            `arn:${this.partition}:s3:::${curBucketName}`,
+            `arn:${this.partition}:s3:::${curBucketName}/*`,
           ],
         })
       );

@@ -18,6 +18,7 @@ import {
   buildPerTeamCostQuery,
 } from '../cur/curAthenaQueries';
 import { parseUsageType } from '../cur/curUsageTypeParser';
+import { usageAmountToTokens } from '../cur/curTokenUnits';
 import { buildExportKey, serializeJsonl } from '../analyticsExport';
 
 interface PerTeamCurRow {
@@ -41,7 +42,11 @@ function parsePerTeamRows(rows: AthenaRow[]): PerTeamCurRow[] {
       endpoint: parsed.endpoint,
       tokenType: parsed.tokenType,
       billedCost: parseFloat(r.total_unblended_cost ?? '0'),
-      tokenCount: parseFloat(r.total_usage_amount ?? '0'),
+      // CUR reports usage in the row's pricing_unit ("1K tokens"); convert to
+      // absolute tokens and round so the Glue bigint column keeps the value.
+      tokenCount: Math.round(
+        usageAmountToTokens(parseFloat(r.total_usage_amount ?? '0'), r.pricing_unit)
+      ),
     });
   }
   return result;

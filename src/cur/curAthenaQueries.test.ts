@@ -11,6 +11,12 @@ describe('buildPerTeamCostQuery', () => {
     expect(sql).toContain("billing_period = '2026-10'");
   });
 
+  it('selects and groups by pricing_unit so token units can be normalised', () => {
+    const sql = buildPerTeamCostQuery('mydb.cur2', '2026-10', 'team');
+    expect(sql).toContain('pricing_unit');
+    expect(sql).toMatch(/GROUP BY .*pricing_unit/);
+  });
+
   it('quotes database and table separately, not as one identifier', () => {
     const sql = buildPerTeamCostQuery('cur2_db.data', '2026-10', 'team');
     expect(sql).toContain('FROM "cur2_db"."data"');

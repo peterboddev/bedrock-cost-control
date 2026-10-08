@@ -368,8 +368,8 @@ commands for steps 1, 2 and 4 and is a reference, not a second procedure):
    **⛔ Gate 2 — the CUR has it:** re-run the Athena query until it returns real
    team names. (This waits on the CUR export delivering to S3, which is
    separate from Gate 1.)
-6. **I.3 (only after Gate 2 passes)** — redeploy with the CUR table to light up
-   the dollar dashboard.
+6. **I.3 (only after Gate 2 passes)** — redeploy with the CUR table (and CUR
+   bucket) to add the **Billed Cost** sheet to both dashboards.
 
 Do the sub-steps strictly in order, and do **not** run the next one until its
 "wait here" check passes — each stage depends on AWS having propagated the
@@ -518,15 +518,38 @@ aws athena start-query-execution --region "$AWS_REGION" \
 
 **I.3 — Redeploy pointed at the CUR table.** Only do this once Gate 2 (I.2's
 Athena check) returns real team names. This creates the CUR cost Lambda + `cur_team_cost`
-table + dollar dashboard:
+table + the **Billed Cost** sheet on both QuickSight dashboards (team dashboard,
+row-level secured; admin dashboard, all teams):
 
 ```bash
 export CUR_DATABASE_NAME="cur2_db"
 export CUR_TABLE_NAME="data"
+# REQUIRED: the S3 bucket your CUR export delivers to. Athena reads the CUR
+# files with the cost Lambda's own credentials, so the stack grants it read on
+# this bucket. Without it, synth fails fast with a clear message (and a Lambda
+# deployed without the grant fails with "not authorized to perform:
+# s3:ListBucket").
+export CUR_BUCKET_NAME="bedrock-cur2-export-$ACCT"
 npx cdk deploy --require-approval never --outputs-file cdk-outputs.json
 ```
 
-*Confirm:* the dollar dashboard populates on its next refresh. Under the hood
+*Confirm:* run the cost Lambda once instead of waiting for its 6-hourly schedule,
+then open the **Billed Cost** sheet:
+
+```bash
+FN=$(aws lambda list-functions --query "Functions[?contains(FunctionName,'CurTeamCostFunction')].FunctionName" --output text)
+aws lambda invoke --function-name "$FN" --cli-binary-format raw-in-base64-out --payload '{}' out.json
+# A "FunctionError" in the response means it failed; otherwise it wrote
+# s3://<analyticsBucket>/cur-team-cost/dt=<today>/part-0.json
+```
+
+Each run writes **month-to-date** totals, and the dashboard shows only the latest
+day's file (the current billing period), so it never double-counts. Rows whose
+usage had no `iamPrincipal/team` tag appear under the team `UNTAGGED` (admin
+dashboard only; the team dashboard's row-level security hides them). Token
+counts on this sheet come from the bill: the CUR reports usage in thousands of
+tokens (`pricing_unit` = "1K tokens"), which the Lambda converts to real counts.
+Under the hood
 the `CurTeamCost` Lambda runs the same `tags['iamPrincipal/team']` query you
 just validated (`buildPerTeamCostQuery`), so if I.2's check returned real teams,
 the dashboard will too.
@@ -1591,7 +1614,7 @@ one place, because CUR touches several accounts-level resources this stack does
 **This stack does NOT create the CUR export, its bucket, the Glue table, or the
 cost-allocation tag.** Those are account-level, must exist first, and are set up
 once by you (the walkthrough below). The stack only *reads* them, and only when
-you opt in by passing `CUR_DATABASE_NAME` + `CUR_TABLE_NAME`.
+you opt in by passing `CUR_DATABASE_NAME` + `CUR_TABLE_NAME` + `CUR_BUCKET_NAME`.
 
 **Exactly what access the stack's CUR cost Lambda is granted** (least-privilege,
 only created when the CUR props are set — see `CurTeamCostFunction` in
@@ -1603,21 +1626,26 @@ only created when the CUR props are set — see `CurTeamCostFunction` in
 - **Glue** — `GetTable` / `GetDatabase` / `GetPartitions`, scoped to exactly the
   CUR database + table you named (`CUR_DATABASE_NAME` / `CUR_TABLE_NAME`). Read
   metadata only — no write, no other tables.
-- **S3** — `GetObject` / `ListBucket` / `GetBucketLocation` / `PutObject` on the
-  stack's **analytics bucket** only (to stage Athena results under
+- **S3 (analytics bucket)** — `GetObject` / `ListBucket` / `GetBucketLocation` /
+  `PutObject` on the stack's **analytics bucket** (to stage Athena results under
   `athena-results/` and write the derived per-team cost under `cur-team-cost/`).
+- **S3 (CUR bucket, read-only)** — `GetObject` / `ListBucket` / `GetBucketLocation`
+  on the bucket you pass as `CUR_BUCKET_NAME` and nothing else. Athena reads the
+  CUR Parquet files with the Lambda's own credentials, so without this the query
+  fails with `not authorized to perform: s3:ListBucket` (we hit exactly this on
+  the first live deploy).
 
 **One access detail to get right:** Athena, when it runs the query, reads the
-CUR Parquet files from the **CUR bucket**. That read is governed by the CUR
-bucket's own policy + the query executor's permissions. If the CUR bucket is in
+CUR Parquet files from the **CUR bucket** using the Lambda's credentials (granted
+by `CUR_BUCKET_NAME`, above). If the CUR bucket is in
 a **different region** (us-east-1) than the stack, cross-region Athena/Glue
 still works because the Glue catalog and CUR are account-global, but the Lambda
 runs Athena **in the stack's region** against a Glue table registered there. In
 practice: register/point at the Glue database+table that Data Exports created
 (step 4), and if the cost Lambda returns empty or an access error, confirm the
-CUR bucket policy allows your account and that the Glue table's S3 `LOCATION`
-points at the CUR bucket. The stack grants the Lambda everything on *its* side;
-the CUR bucket + Glue table are the account-owned pieces that must line up.
+Glue table's S3 `LOCATION` points at the CUR bucket you passed as
+`CUR_BUCKET_NAME`. The stack grants the Lambda read on that bucket; the CUR
+bucket + Glue table are the account-owned pieces that must line up.
 
 **Nothing dollar-related is stored by this stack except the derived output.**
 The raw CUR stays in your CUR bucket; the stack only writes the small
@@ -1824,6 +1852,7 @@ Then redeploy the stack with the CUR props (this creates the CUR cost Lambda +
 ```bash
 export CUR_DATABASE_NAME="cur2_db"
 export CUR_TABLE_NAME="data"
+export CUR_BUCKET_NAME="bedrock-cur2-export-$ACCT"   # required: the Lambda is granted read on it
 npm run infra:deploy
 ```
 
@@ -1835,7 +1864,7 @@ npm run infra:deploy
 > (Verified live: Bedrock line items were present in CUR within the hour, with
 > no tag keys on them yet.)
 
-Omit `CUR_DATABASE_NAME` / `CUR_TABLE_NAME` and the stack skips the CUR cost
+Omit `CUR_DATABASE_NAME` / `CUR_TABLE_NAME` / `CUR_BUCKET_NAME` and the stack skips the CUR cost
 Lambda entirely — token tracking and enforcement still work fully; only the
 dollar cost dashboards have no data.
 

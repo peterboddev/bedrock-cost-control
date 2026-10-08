@@ -45,12 +45,13 @@ export function buildPerTeamCostQuery(
       ${tagColumn} AS team,
       line_item_usage_type,
       SUM(CAST(line_item_unblended_cost AS double)) AS total_unblended_cost,
+      pricing_unit,
       SUM(CAST(line_item_usage_amount AS double)) AS total_usage_amount
     FROM ${quotedTable}
     WHERE line_item_product_code IN ('AmazonBedrock', 'AmazonBedrockService')
       AND line_item_line_item_type = 'Usage'
       AND billing_period = '${billingPeriod}'
-    GROUP BY ${tagColumn}, line_item_usage_type
+    GROUP BY ${tagColumn}, line_item_usage_type, pricing_unit
   `.trim();
 }
 

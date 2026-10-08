@@ -56,6 +56,12 @@ const quickSightPrincipalArn = process.env.QUICKSIGHT_PRINCIPAL_ARN?.trim() || u
  */
 const curDatabaseName = process.env.CUR_DATABASE_NAME?.trim() || undefined;
 const curTableName = process.env.CUR_TABLE_NAME?.trim() || undefined;
+/**
+ * CUR_BUCKET_NAME (required when CUR_DATABASE_NAME + CUR_TABLE_NAME are set):
+ * the S3 bucket the CUR 2.0 export delivers to. The cost Lambda is granted
+ * read on it. Example: export CUR_BUCKET_NAME="bedrock-cur2-export-123456789012"
+ */
+const curBucketName = process.env.CUR_BUCKET_NAME?.trim() || undefined;
 
 new BedrockTeamTokenQuotaStack(app, "BedrockTeamTokenQuotaStack", {
   // Default (dev/sandbox) removal policy and team tag key are used here.
@@ -64,4 +70,5 @@ new BedrockTeamTokenQuotaStack(app, "BedrockTeamTokenQuotaStack", {
   quickSightPrincipalArn,
   curDatabaseName,
   curTableName,
+  curBucketName,
 });
