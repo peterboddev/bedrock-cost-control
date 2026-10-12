@@ -2128,7 +2128,7 @@ export class BedrockTeamTokenQuotaStack extends Stack {
       new QuickSightDashboard(this, "CostDashboard", {
         awsAccountId: this.account,
         dashboardId: "bedrock-team-token-quota-cost",
-        name: "Bedrock Team Token Usage",
+        name: "Bedrock Team Token Usage & Cost",
         definition: {
           dataSetIdentifierDeclarations: [
             { identifier: "usageCost", dataSetArn: mainDataSet.attrArn },
@@ -2282,7 +2282,7 @@ export class BedrockTeamTokenQuotaStack extends Stack {
       new QuickSightDashboard(this, "CostAdminDashboard", {
         awsAccountId: this.account,
         dashboardId: "bedrock-team-token-quota-cost-admin",
-        name: "Bedrock Team Token Usage (Admin - All Teams)",
+        name: "Bedrock Team Token Usage & Cost (Admin - All Teams)",
         definition: {
           dataSetIdentifierDeclarations: [
             { identifier: "usageCostAdmin", dataSetArn: adminDataSet.attrArn },

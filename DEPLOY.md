@@ -14,9 +14,11 @@ only the deploy procedure.
    exceeds it, the stack attaches a real IAM **deny** policy to that team's
    role(s) for the rest of the day (not just an alert), then lifts it
    automatically at 00:00 UTC.
-2. **QuickSight dashboards, per team**
-   - **Token-usage** dashboards (fresh within minutes).
-   - **Billed-dollar** dashboards from **AWS Cost & Usage Report (CUR 2.0)**,
+2. **Two QuickSight dashboards, split by audience** (admin = all teams; team =
+   row-level secured) — **not** split by metric. Each carries, as separate
+   sheets (tabs):
+   - a **Token-usage** view (fresh within minutes), and
+   - a **Billed Cost** view from **AWS Cost & Usage Report (CUR 2.0)**,
      attributed per team — the actual billed figure, no estimation.
 
 ## The one unavoidable wait
@@ -379,12 +381,16 @@ npx cdk diff     # expect only ADDITIONS (QuickSight data source, datasets, 2 da
 npx cdk deploy --require-approval never --outputs-file cdk-outputs.json
 ```
 
-This creates **two** dashboards:
+This creates **two** dashboards, split by **audience** — each carries a
+token-usage view and (after Part 7) a **Billed Cost** view as separate sheets:
 
-| Dashboard id | Row-level security | For |
-|---|---|---|
-| `bedrock-team-token-quota-cost-admin` | none — all teams | admins / FinOps |
-| `bedrock-team-token-quota-cost` | yes — each user sees only their team(s) | team leads |
+| Dashboard (display name) | Id | Row-level security | For |
+|---|---|---|---|
+| Bedrock Team Token Usage & Cost (Admin - All Teams) | `bedrock-team-token-quota-cost-admin` | none — all teams | admins / FinOps |
+| Bedrock Team Token Usage & Cost | `bedrock-team-token-quota-cost` | yes — each user sees only their team(s) | team leads |
+
+> The dollar view is the **Billed Cost** sheet *inside* each dashboard (switch
+> with the sheet tabs at the top), not a separate "cost" dashboard.
 
 ### 6d. Upload row-level-security rules (so the team dashboard renders)
 

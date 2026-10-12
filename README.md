@@ -201,9 +201,10 @@ deny-policy isolation, retry/failure handling, and audit fidelity.
 
 **To deploy, follow [DEPLOY.md](./DEPLOY.md).** It is the complete, ordered,
 CLI-only runbook: start the CUR export, deploy the core stack, allow models,
-set per-team token quotas, generate usage and verify enforcement, stand up both
-QuickSight dashboards (token-usage and CUR 2.0 billed-dollar), verify, and tear
-down. This README is the *reference* (what it is and how it works); DEPLOY.md is
+set per-team token quotas, generate usage and verify enforcement, stand up the
+two QuickSight dashboards (admin all-teams and team RLS — each with
+token-usage and CUR 2.0 billed-cost sheets), verify, and tear down. This README
+is the *reference* (what it is and how it works); DEPLOY.md is
 the *procedure* (how to deploy it).
 
 **What the stack deploys:** 6 DynamoDB tables, an S3 bucket, an SNS topic, 7+
@@ -279,12 +280,19 @@ The exact `aws iam put-role-policy` grant — two statements on
 
 #### Two dashboards: admin (all teams) vs team (row-level security)
 
-The stack creates **two** dashboards, by design:
+The stack creates **two** dashboards, split by **audience** (not by metric) —
+each carries both a **token-usage** view and a **Billed Cost** view as separate
+sheets (tabs):
 
-| Dashboard | Id | Dataset RLS | Who it's for |
-|---|---|---|---|
-| **Admin** | `bedrock-team-token-quota-cost-admin` | **none** — shows every team | admins / FinOps |
-| **Team** | `bedrock-team-token-quota-cost` | **row-level security** — a user sees only their own team(s) | individual team leads |
+| Dashboard (display name) | Id | Sheets | Dataset RLS | Who it's for |
+|---|---|---|---|---|
+| **Bedrock Team Token Usage & Cost (Admin - All Teams)** | `bedrock-team-token-quota-cost-admin` | All Teams · Enforcement · Billed Cost | **none** — shows every team | admins / FinOps |
+| **Bedrock Team Token Usage & Cost** | `bedrock-team-token-quota-cost` | Token Usage · Billed Cost | **row-level security** — a user sees only their own team(s) | individual team leads |
+
+> The dollar view is the **Billed Cost** sheet *inside* each dashboard (switch
+> sheets with the tabs at the top), **not** a separate "cost" dashboard. The id
+> contains `-cost` and the display name includes "& Cost", but there is no
+> standalone cost dashboard to look for in the Dashboards list.
 
 The **admin dashboard works immediately** after deploy (no RLS). The **team
 dashboard applies row-level security**, and on a fresh deploy it shows:
