@@ -213,6 +213,16 @@ export TEST_ROLE_TRUSTED_PRINCIPAL_ARNS="arn:aws:iam::<account-id>:role/<your-ss
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 ```
 
+> **Every redeploy must carry the same environment.** The stack builds optional
+> parts (QuickSight, the CUR cost pipeline) from environment variables, and
+> CloudFormation **deletes** whatever a missing variable switches off. A new
+> shell has none of your earlier exports; deploying without
+> `QUICKSIGHT_PRINCIPAL_ARN` (step H) deletes all QuickSight dashboards and
+> datasets, and without `TEST_ROLE_TRUSTED_PRINCIPAL_ARNS` the deploy fails.
+> Re-export everything you used before, and run `npx cdk diff` before every
+> `npx cdk deploy`: anything marked `[-]` that you did not mean to remove
+> means a variable is missing, so stop.
+
 **A. Prerequisites.** Node 20+, AWS CLI configured, Bedrock **model access**
 enabled for the model(s) you'll test (Bedrock console → Model access), and — if
 you want dashboards — an existing **QuickSight** subscription with a user.
@@ -452,7 +462,8 @@ this query (re-crawl first if you changed the export) until it returns
 non-blank teams:
 
 ```bash
-BUCKET=<AnalyticsExportBucket id>   # for Athena results
+# The analytics bucket is NOT a stack output; find it by name prefix:
+BUCKET=$(aws s3 ls | awk '{print $3}' | grep analyticsexportbucket)   # for Athena results
 aws athena start-query-execution --region "$AWS_REGION" \
   --work-group bedrock-team-token-quota \
   --query-execution-context Database=cur2_db \
@@ -491,6 +502,15 @@ table + the **Billed Cost** sheet on both QuickSight dashboards (team dashboard,
 row-level secured; admin dashboard, all teams):
 
 ```bash
+# This runs a day or more after the install, usually in a NEW shell. Re-export
+# everything from the first deploy and step H, or the deploy will delete what
+# the missing variables switch on (see the rule above).
+export AWS_PROFILE=your-profile-name
+export AWS_REGION=us-east-2
+export TEST_ROLE_TRUSTED_PRINCIPAL_ARNS="arn:aws:iam::<account-id>:role/<your-sso-or-iam-principal>"
+export QUICKSIGHT_PRINCIPAL_ARN="arn:aws:quicksight:<home-region>:<account-id>:user/default/<your-qs-username>"   # same value as step H
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+
 export CUR_DATABASE_NAME="cur2_db"
 export CUR_TABLE_NAME="data"
 # REQUIRED: the S3 bucket your CUR export delivers to. Athena reads the CUR
@@ -499,6 +519,10 @@ export CUR_TABLE_NAME="data"
 # deployed without the grant fails with "not authorized to perform:
 # s3:ListBucket").
 export CUR_BUCKET_NAME="bedrock-cur2-export-$ACCT"
+
+npx cdk diff      # expect only ADDITIONS (cost Lambda, cur_team_cost table, Billed Cost
+                  # sheet + datasets). Any QuickSight resource marked [-] means
+                  # QUICKSIGHT_PRINCIPAL_ARN is missing: STOP and fix it.
 npx cdk deploy --require-approval never --outputs-file cdk-outputs.json
 ```
 
@@ -1815,15 +1839,9 @@ aws glue get-tables --region "$AWS_REGION" --database-name cur2_db --query "Tabl
 #     verified with a live Athena query).
 ```
 
-Then redeploy the stack with the CUR props (this creates the CUR cost Lambda +
-`cur_team_cost` table + dollar dashboard):
-
-```bash
-export CUR_DATABASE_NAME="cur2_db"
-export CUR_TABLE_NAME="data"
-export CUR_BUCKET_NAME="bedrock-cur2-export-$ACCT"   # required: the Lambda is granted read on it
-npm run infra:deploy
-```
+Then redeploy the stack with the CUR props, exactly as in **step I.3** of the
+A-Z walkthrough (it lists every variable a redeploy needs, including
+`QUICKSIGHT_PRINCIPAL_ARN`; a redeploy missing it deletes the dashboards).
 
 > **Per-team dollars still wait on the `iamPrincipal/team` tag (step I.1).** Even
 > with the Glue table and the redeploy done, the CUR cost Lambda groups cost by
