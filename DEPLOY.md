@@ -192,6 +192,13 @@ echo "$ADMIN_FN"
 > Lambda directly. There is also a browser UI (Cognito login) for the same
 > operations — see "Budget UI" in [README.md](./README.md) — but it is optional
 > and not needed to follow this guide.
+>
+> **If you want that UI, now is the moment to set it up** — the stack is
+> deployed and the Cognito IDs are already in `cdk-outputs.json`. Follow
+> README's "Budget UI" section: copy those IDs into `web/.env`, then create a
+> Cognito admin user with `aws cognito-idp admin-create-user`. The email you
+> pass there is your **login username** (you type it again at the UI sign-in
+> screen); it is not an env var or a stack parameter.
 
 ---
 

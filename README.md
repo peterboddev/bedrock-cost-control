@@ -598,6 +598,12 @@ There is no self-service sign-up — an operator provisions each user. Create
 one with the AWS CLI, substituting your User Pool ID (the
 `AdminUserPoolIdOutput` value) and the login email:
 
+> The email you set below is the Cognito **username** and your **login
+> identity**: you enter it (with the password from step 2) at the UI sign-in
+> screen in step 3. It is **not** an environment variable or a stack
+> parameter — these CLI commands are the only place it goes. `web/.env` holds
+> only the four `VITE_*` IDs, never the email.
+
 ```bash
 # Point the CLI at the account/region you deployed to first, e.g.:
 export AWS_PROFILE=your-profile-name
