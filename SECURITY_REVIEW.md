@@ -174,16 +174,31 @@ in both the code and the README.
 ## Dependencies
 
 All AWS SDK packages pinned to `3.1098.0`; CDK pinned to `2.262.2`.
-DevDependencies are well-known packages at pinned versions. The
-`brace-expansion@5.0.9` override + `patches/` patch-package fix is a
-mitigation for CVE-2024-4067 in CDK's bundled `minimatch`; documented in
-README and `scripts/fixBundledDepAuditMetadata.js`.
+DevDependencies are well-known packages at pinned versions. The test toolchain
+runs on `jest@30`. A `brace-expansion` fix for CDK's *bundled* `minimatch` is
+applied at install time (see below and `scripts/fixBundledDepAuditMetadata.js`).
 
-**`npm audit` findings are dev-only.** The high-severity advisories reported
-by `npm audit` are all in the devDependency / build-tooling tree (CDK CLI
-transitive deps and test tooling), none of which ship in any deployed Lambda
-bundle or the web app. Runtime dependencies are clean. `npm audit fix` can be
-run cosmetically but is not required for a safe release.
+**Production/runtime tree is clean.** `npm audit --omit=dev` reports **0
+vulnerabilities** — nothing shipped in any deployed Lambda bundle or the web app
+is affected.
+
+**Remaining `npm audit` findings are dev-only and 0 are high severity.** A full
+`npm audit` reports ~20 **moderate** findings, all tracing to one root cause:
+jest's coverage tooling (`babel-plugin-istanbul` → `@istanbuljs/load-nyc-config`)
+pins `js-yaml@3.x` → `argparse@1.x` → `sprintf-js`. `@istanbuljs/load-nyc-config`
+is dormant and depends on the `js-yaml` 3.x API, so these cannot be force-upgraded
+without breaking coverage; npm's only offered remedy is to *downgrade* `ts-jest`.
+They are build-time only and never reach a deployed artifact.
+
+**`brace-expansion` (bundled in `aws-cdk-lib`).** The advisory range
+`4.0.0 - 5.0.11` (GHSA-q2hr-2g5m-vwhr / GHSA-qhr7-859c-m2p7 / GHSA-6j4f-fj2g-mc7p)
+covers a copy bundled inside the `aws-cdk-lib` tarball that npm `overrides` can't
+reach. A `postinstall` hook copies the fixed `brace-expansion@5.0.12` (pinned via
+`overrides`) over the bundled copy and reconciles the lockfile metadata `npm
+audit` reads; 5.0.12 is API-compatible with the bundled 5.0.x line and CDK synth
+is verified unaffected. This replaced an earlier patch-package approach, which was
+removed along with its own vulnerable transitive deps (`braces`/`micromatch`).
+Documented in the README.
 
 ## Pre-push checklist
 
@@ -201,6 +216,7 @@ run cosmetically but is not required for a safe release.
 - [x] `RemovalPolicy.DESTROY` documented as sandbox default with RETAIN guidance
 - [x] CUR cost Lambda grants resource-scoped except unavoidable Athena `*`
 - [x] QuickSight dashboards shared only with deploying principal; RLS per team
-- [x] `npm audit` highs confirmed dev-only (no runtime/shipped impact)
+- [x] `npm audit --omit=dev` clean (0 runtime/shipped vulnerabilities)
+- [x] Full `npm audit`: 0 high; ~20 moderate are dev-only (jest coverage / js-yaml 3.x)
 - [x] 292/292 tests pass
 - [x] `tsc --noEmit` + `infra:check` + `cdk synth` clean

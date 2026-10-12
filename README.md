@@ -1229,16 +1229,27 @@ invocations (see
   the Cost and Usage Report (per-team billed cost) and by QuickSight for the
   dashboards. It's a natural future addition for longer-horizon ad-hoc
   reporting over the raw logs.
-- **Dependency vulnerabilities**: `npm audit` reports **0 vulnerabilities**. One
-  high-severity finding (`brace-expansion` GHSA-mh99-v99m-4gvg) is a *bundled*
-  dependency inside the `aws-cdk-lib` tarball that npm `overrides` can't reach and
-  AWS hasn't yet shipped a patched `aws-cdk-lib` for, so it's fixed at install time
-  via a `postinstall` hook: `patch-package` (see `patches/`) swaps in the patched
-  `brace-expansion@5.0.9` source, and `scripts/fixBundledDepAuditMetadata.js`
-  reconciles the lockfile/`package.json` metadata `npm audit` reads. Both steps are
-  idempotent and verified to survive a clean `rm -rf node_modules && npm install`. If
-  a future `aws-cdk-lib` release bundles a non-vulnerable `brace-expansion`, the patch
-  and script become no-ops and can be removed.
+- **Dependency vulnerabilities**: `npm audit --omit=dev` reports **0 vulnerabilities**
+  for the production/runtime tree (nothing shipped in any Lambda bundle or the web app
+  is affected). A full `npm audit` reports ~20 **moderate**, **dev-only** findings that
+  all trace to a single root cause: jest's coverage tooling (`babel-plugin-istanbul` →
+  `@istanbuljs/load-nyc-config`) pins `js-yaml@3.x`, which pulls `argparse@1.x` →
+  `sprintf-js`. `@istanbuljs/load-nyc-config` is effectively dormant and depends on the
+  `js-yaml` 3.x API, so these can't be force-upgraded without breaking coverage, and
+  npm's only offered "fix" is to *downgrade* `ts-jest` — not worth it. They are
+  build-time only and never reach a deployed artifact.
+  - **`brace-expansion` (bundled in `aws-cdk-lib`)**: the advisory range
+    (`4.0.0 - 5.0.11`, GHSA-q2hr-2g5m-vwhr / GHSA-qhr7-859c-m2p7 / GHSA-6j4f-fj2g-mc7p)
+    covers a *bundled* copy inside the `aws-cdk-lib` tarball that npm `overrides` can't
+    reach, and AWS hasn't yet shipped a CDK release with a fixed bundle. It's closed at
+    install time by a `postinstall` hook (`scripts/fixBundledDepAuditMetadata.js`): the
+    script copies the fixed `brace-expansion@5.0.12` that `overrides` pins at the top
+    level over the bundled copy, then reconciles the lockfile metadata `npm audit`
+    reads. 5.0.12 is API-compatible with the bundled 5.0.x line, so CDK synth is
+    unaffected (verified). The step is idempotent and survives a clean
+    `rm -rf node_modules && npm install`. If a future `aws-cdk-lib` bundles a
+    non-vulnerable `brace-expansion`, the override and script become no-ops and can be
+    removed.
 
 ## Troubleshooting
 
