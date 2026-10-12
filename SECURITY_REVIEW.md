@@ -1,7 +1,7 @@
 # Security Review
 
-Pre-publication review for public GitHub release. Last updated during the
-security hardening pass (October 2026).
+Pre-publication review for public GitHub release. Last updated after the
+CUR 2.0 per-team cost pipeline + QuickSight dashboards were added (October 2026).
 
 ## Secrets / credential scan
 
@@ -37,6 +37,7 @@ search: no `grantReadData`/`grantWriteData`/`grantReadWriteData` calls or
 | Reconciliation | `iam:ListRoles`, `iam:GetRole`, `iam:ListRoleTags` | Paginates all roles; read-only enumeration. |
 | Mantle collector | `cloudwatch:GetMetricData` | CloudWatch does not support resource-level scoping. |
 | Model Invocation Logging | `bedrock:Put/DeleteModelInvocationLoggingConfiguration` | Account singleton, no ARN to scope to. |
+| CUR Per-Team Cost | `athena:StartQueryExecution`, `athena:GetQueryExecution`, `athena:GetQueryResults` | Athena has no resource-level scoping for query execution. All other grants on this Lambda are resource-scoped (see below). |
 
 **Production hardening recommendation**: Use SCPs or `iam:ResourceTag`
 condition keys to constrain which roles the `PutRolePolicy`/`DeleteRolePolicy`
@@ -52,6 +53,38 @@ resource, one stage. No other AWS action or resource is granted.
 
 Requires explicit `TEST_ROLE_TRUSTED_PRINCIPAL_ARNS` (fails fast if empty).
 Never trusts the whole account.
+
+### CUR Per-Team Cost Lambda (scoped grants)
+
+Beyond the Athena `*` grant above (unavoidable — Athena has no resource-level
+scoping), every other permission on `CurTeamCostFunction` is resource-scoped:
+
+- **Glue** (`glue:GetTable`, `GetDatabase`, `GetPartitions`): scoped to the
+  account catalog plus the specific CUR database and table ARNs only.
+- **S3 read of CUR export** (`s3:GetObject`, `GetBucketLocation`, `ListBucket`):
+  scoped to the CUR export bucket and its objects only. Required because Athena
+  reads the underlying CUR data files with the caller's credentials.
+- **S3 on analytics bucket** (`s3:GetObject`, `GetBucketLocation`, `ListBucket`,
+  `PutObject`): scoped to the analytics bucket, its `athena-results/*` prefix,
+  and its `cur-team-cost/*` export prefix. No account-wide S3 access.
+
+## QuickSight (CUR cost dashboards)
+
+The CUR 2.0 cost pipeline feeds two QuickSight dashboards
+(`bedrock-team-token-quota-cost`, the RLS-scoped per-team view, and
+`bedrock-team-token-quota-cost-admin`, the admin all-teams view), backed by
+SPICE datasets over the `cur-team-cost/` analytics export.
+
+- Dashboards are shared only with the deploying QuickSight principal
+  (`QUICKSIGHT_PRINCIPAL_ARN`); no account-wide or public sharing.
+- Row-level security (RLS) restricts per-team viewers to their own team's rows
+  via a committed `rls/rules.json` mapping; the admin dashboard sees all teams.
+- **Operator-applied grant (not in this stack)**: QuickSight's own service role
+  (`aws-quicksight-service-role-v0`) must be granted read on the analytics
+  bucket's `cur-team-cost/` prefix for SPICE ingestion. This is applied once by
+  the operator during setup (documented in `DEPLOY.md`), lives outside the CDK
+  stack, and is scoped to that prefix — it is intentionally not managed here
+  because the QuickSight service role is an account-level resource.
 
 ## S3 bucket security
 
@@ -146,6 +179,12 @@ DevDependencies are well-known packages at pinned versions. The
 mitigation for CVE-2024-4067 in CDK's bundled `minimatch`; documented in
 README and `scripts/fixBundledDepAuditMetadata.js`.
 
+**`npm audit` findings are dev-only.** The high-severity advisories reported
+by `npm audit` are all in the devDependency / build-tooling tree (CDK CLI
+transitive deps and test tooling), none of which ship in any deployed Lambda
+bundle or the web app. Runtime dependencies are clean. `npm audit fix` can be
+run cosmetically but is not required for a safe release.
+
 ## Pre-push checklist
 
 - [x] No secrets/credentials/API keys in any tracked file
@@ -160,5 +199,8 @@ README and `scripts/fixBundledDepAuditMetadata.js`.
 - [x] S3 buckets: block-all, SSL-only, encrypted, lifecycle rules
 - [x] Cognito MFA off documented with production-enable instructions
 - [x] `RemovalPolicy.DESTROY` documented as sandbox default with RETAIN guidance
-- [x] 242/242 tests pass
+- [x] CUR cost Lambda grants resource-scoped except unavoidable Athena `*`
+- [x] QuickSight dashboards shared only with deploying principal; RLS per team
+- [x] `npm audit` highs confirmed dev-only (no runtime/shipped impact)
+- [x] 292/292 tests pass
 - [x] `tsc --noEmit` + `infra:check` + `cdk synth` clean
