@@ -347,7 +347,7 @@ command and also the "is it time yet?" gate. If the `iamPrincipal/team` key is
 already listed in your billing account it succeeds immediately (it did when we
 re-ran the README on an account that had used the tag before); if it errors
 "Tag keys not found", stop, wait, and come back later. Either way the remaining
-wait (the CUR delivering your post-activation usage) is about a day.
+wait (the CUR delivering your post-activation usage) is around 24 hours.
 
 **The complete CUR order, start to finish** (this is the one sequence to
 follow; the "CUR 2.0 setup walkthrough" section further down holds the full
@@ -438,9 +438,9 @@ step 4). Result: `CUR_DATABASE_NAME=cur2_db`, `CUR_TABLE_NAME=data`, cataloged i
 **⛔ WAIT HERE until this query returns real team names.** CUR 2.0 puts
 IAM-principal tags in the `tags` **map** column under the key
 `iamPrincipal/team`, and only on line items for usage *after* I.1 succeeded. The
-CUR export delivers new files to S3 on its own schedule: on our test account a
-usage day's rows arrived about half a day after that day closed. To see when the
-last delivery happened:
+CUR export delivers new files to S3 on its own schedule; allow around 24
+hours after your usage day for its rows (with their team values) to appear. To
+see when the last delivery happened:
 
 ```bash
 aws bcm-data-exports list-exports --region us-east-1 \
@@ -1655,7 +1655,7 @@ this solution**:
   — this section just holds the commands for Steps 1, 2 and 4.
 - Because the tag activation (step I.1) requires billing to have already seen a
   Bedrock call from a `team`-tagged role, the realistic cold-start for the
-  dollar view is **~1-3 days** on a brand-new account — all AWS-side waiting,
+  dollar view is **about 1-2 days** on a brand-new account — all AWS-side waiting,
   not solution setup. On an account that already has CUR + the tag active, it's
   effectively immediate (just Step 4 and the redeploy).
 
@@ -1828,7 +1828,7 @@ npm run infra:deploy
 > **Per-team dollars still wait on the `iamPrincipal/team` tag (step I.1).** Even
 > with the Glue table and the redeploy done, the CUR cost Lambda groups cost by
 > `tags['iamPrincipal/team']` — which CUR only populates **after** the tag is
-> activated (step I.1) and billing processes usage under it (~24-48h). Until then
+> activated (step I.1) and billing processes usage under it (around 24h). Until then
 > the pipeline is wired correctly but the per-team cost visual is empty.
 > (Verified live: Bedrock line items were present in CUR within the hour, with
 > no tag keys on them yet.)
