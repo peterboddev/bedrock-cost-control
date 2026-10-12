@@ -12,6 +12,12 @@ deny policy once a quota is exceeded, and get automatically restored by the
 scheduled daily reset — with no manual or periodic triggering anywhere in
 the enforcement path.
 
+> **Deploying? Follow [DEPLOY.md](./DEPLOY.md).** It is the complete, ordered,
+> CLI-only runbook (deploy → per-team token quotas → enforcement → both
+> QuickSight dashboards, including CUR 2.0 billed-dollar → verify → teardown).
+> **This README is the reference** — what the system is, how it works, and the
+> design rationale behind it.
+
 > **This is a reference implementation / sample code**, provided as-is
 > under the [MIT License](./LICENSE) to demonstrate a working approach to
 > per-team Bedrock token-quota enforcement. It is not an officially
@@ -193,397 +199,27 @@ deny-policy isolation, retry/failure handling, and audit fidelity.
 
 ## Deploying
 
-### Full deploy-and-test walkthrough (A-Z, in order)
-
-Follow this top to bottom to stand up and verify the **whole** solution on a
-clean account. It is the exact order the maintainers ran, verified end to end.
-Each step says what to run and how to **confirm it worked** before moving on.
-The detailed topic sections further below expand on each step.
-
-The only part with a long clock is CUR dollar cost — so you **start CUR first**
-(step B), let AWS churn on it for a day, and finish it last (step I). Everything
-in between is same-day and gives a fully working product (tokens, enforcement,
-dashboards) within minutes.
-
-```bash
-# Set once, used throughout:
-export AWS_PROFILE=your-profile-name
-export AWS_REGION=us-east-2        # your deploy/stack region
-export TEST_ROLE_TRUSTED_PRINCIPAL_ARNS="arn:aws:iam::<account-id>:role/<your-sso-or-iam-principal>"
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-```
-
-> **Every redeploy must carry the same environment.** The stack builds optional
-> parts (QuickSight, the CUR cost pipeline) from environment variables, and
-> CloudFormation **deletes** whatever a missing variable switches off. A new
-> shell has none of your earlier exports; deploying without
-> `QUICKSIGHT_PRINCIPAL_ARN` (step H) deletes all QuickSight dashboards and
-> datasets, and without `TEST_ROLE_TRUSTED_PRINCIPAL_ARNS` the deploy fails.
-> Re-export everything you used before, and run `npx cdk diff` before every
-> `npx cdk deploy`: anything marked `[-]` that you did not mean to remove
-> means a variable is missing, so stop.
-
-**A. Prerequisites.** Node 20+, AWS CLI configured, Bedrock **model access**
-enabled for the model(s) you'll test (Bedrock console → Model access), and — if
-you want dashboards — an existing **QuickSight** subscription with a user.
-
-**B. Start CUR enablement NOW (longest clock — do it first, then move on).**
-Only if you want the dollar-cost view. Create the CUR bucket and export (full
-commands + bucket policy in
-[CUR 2.0 setup walkthrough](#cur-20-setup-walkthrough-one-time-per-account),
-Steps 1-2). **The export must be created with IAM principal data
-(`INCLUDE_IAM_PRINCIPAL_DATA=TRUE`)** — the Step 2 commands do this; without it
-per-team dollars can never appear. If your account **already** has a CUR 2.0
-export, check it has that option:
-`aws bcm-data-exports get-export --region us-east-1 --export-arn <arn> --query "Export.DataQuery.TableConfigurations.COST_AND_USAGE_REPORT.INCLUDE_IAM_PRINCIPAL_DATA"`
-must print `TRUE`; if not, create a new export (see "Already created the
-export without IAM principal data?" in that walkthrough). This starts the AWS
-billing clock. Do **not** wait on it — continue to step C immediately.
-
-**C. Deploy the core stack.**
-
-```bash
-npm install
-npx cdk deploy --require-approval never --outputs-file cdk-outputs.json
-```
-
-*Confirm:* ends with `✅ BedrockTeamTokenQuotaStack` and writes
-`cdk-outputs.json`. You now have the Admin API endpoint, Cognito ids, and bucket
-names in that file.
-
-**D. Create the admin user + web config.** Read ids from `cdk-outputs.json`.
-
-```bash
-USER_POOL_ID=<AdminUserPoolIdOutput>
-EMAIL=admin@example.com
-aws cognito-idp admin-create-user --user-pool-id "$USER_POOL_ID" --username "$EMAIL" \
-  --user-attributes Name=email,Value="$EMAIL" Name=email_verified,Value=true --message-action SUPPRESS
-aws cognito-idp admin-set-user-password --user-pool-id "$USER_POOL_ID" --username "$EMAIL" \
-  --password '<a-strong-password>' --permanent
-aws cognito-idp admin-add-user-to-group --user-pool-id "$USER_POOL_ID" --username "$EMAIL" --group-name budget-admins
-# Write web/.env from the cdk outputs (see "Budget UI (web/)" for the exact keys), then:
-cd web && npm install && npm run dev     # http://localhost:5173
-```
-
-*Confirm:* sign in at the dev URL; the UI loads with empty team/model lists
-(expected on a fresh deploy).
-
-**E. Allow some models (so teams can be budgeted).**
-
-*Default (UI):* in the UI's **Admin — allowed models** section, pick Endpoint →
-Region → (Converse) Scope → **Load models** → pick a model → **Allow**.
-
-*Alternative (CLI):* the UI's **Allow** button just calls the
-`putModelRegistryEntry` Admin API op — you can do the same from the shell (this
-is the exact command the maintainers run in a headless/scripted install):
-
-```bash
-ADMIN_FN=$(aws cloudformation describe-stacks --stack-name BedrockTeamTokenQuotaStack \
-  --query "Stacks[0].Outputs[?OutputKey=='AdminApiFunctionNameOutput'].OutputValue" --output text)
-# Allow amazon.nova-lite-v1:0 on bedrock-runtime, Regional scope, in your region:
-aws lambda invoke --function-name "$ADMIN_FN" --cli-binary-format raw-in-base64-out \
-  --payload '{"operation":"putModelRegistryEntry","payload":{"modelId":"amazon.nova-lite-v1:0","endpoint":"bedrock-runtime","provider":"amazon","scope":"regional","region":"us-east-2"}}' \
-  out.json && cat out.json   # -> {"ok":true}
-```
-
-*Confirm (either path):* the model appears under "Currently allowed" in the UI
-and in the budget picker's Model dropdown. From the CLI you can confirm with
-`listModelRegistry`:
-
-```bash
-aws lambda invoke --function-name "$ADMIN_FN" --cli-binary-format raw-in-base64-out \
-  --payload '{"operation":"listModelRegistry"}' out.json && cat out.json
-# -> {"ok":true,"data":[{"modelId":"amazon.nova-lite-v1:0","endpoint":"bedrock-runtime",...}]}
-```
-
-**F. Generate real team-tagged usage** (this also feeds CUR's tag clock — doing
-it now matters). Full copy-paste block in
-[Step 1 — generate real Converse usage](#step-1--generate-real-converse-usage-per-team):
-it creates `SampleTeamRole-{alpha,beta,gamma}`, assumes each, and sends Converse
-calls. *Confirm:* each call prints a token count.
-
-**G. Verify the pipeline attributed usage, then export for dashboards.**
-
-```bash
-# Per-team counters landed (proof of end-to-end attribution):
-aws dynamodb scan --table-name Usage_Aggregation \
-  --projection-expression "PK,SK,inputTokens,outputTokens" --region "$AWS_REGION"
-#  -> rows like PK="TEAM#alpha#MODEL#...". A call from an untagged role shows as
-#     TEAM#UNMAPPED# — correct, not an error.
-
-# Publish to the analytics bucket QuickSight reads:
-EXPORT_FN=$(aws lambda list-functions --query "Functions[?contains(FunctionName,'AnalyticsExportFunction')].FunctionName" --output text)
-aws lambda invoke --function-name "$EXPORT_FN" --cli-binary-format raw-in-base64-out --payload '{}' out.json
-```
-
-*Confirm:* the scan shows per-team rows; `s3://<analyticsBucket>/token-usage/dt=<today>/part-0.json` exists.
-
-**H. (Optional) QuickSight dashboards.** Grant the service role S3 access
-**first** (read **and** Athena-results write — a read-only grant fails the
-data-source connection test), then redeploy with the principal ARN (in
-QuickSight's **home region**, which may differ from the stack region):
-
-```bash
-# The analytics bucket is NOT a stack output; find it by name prefix:
-BUCKET=$(aws s3 ls | awk '{print $3}' | grep analyticsexportbucket)
-aws iam put-role-policy --role-name aws-quicksight-service-role-v0 \
-  --policy-name BedrockTeamTokenQuotaAnalyticsBucketAccess \
-  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[
-    {\"Sid\":\"ReadAnalyticsData\",\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:ListBucket\",\"s3:GetBucketLocation\"],\"Resource\":[\"arn:aws:s3:::$BUCKET\",\"arn:aws:s3:::$BUCKET/*\"]},
-    {\"Sid\":\"WriteAthenaResults\",\"Effect\":\"Allow\",\"Action\":[\"s3:PutObject\",\"s3:AbortMultipartUpload\"],\"Resource\":[\"arn:aws:s3:::$BUCKET/athena-results/*\"]}
-  ]}"
-
-export QUICKSIGHT_PRINCIPAL_ARN="arn:aws:quicksight:<home-region>:$ACCT:user/default/<your-qs-username>"
-npx cdk deploy --require-approval never --outputs-file cdk-outputs.json
-
-# Team dashboard uses row-level security — upload RLS rules so it renders
-# (the ADMIN dashboard works without this):
-QS_USER="<your quicksight username>"
-printf '%s\n' "{\"username\":\"$QS_USER\",\"team\":\"alpha\"}" \
-              "{\"username\":\"$QS_USER\",\"team\":\"beta\"}" \
-              "{\"username\":\"$QS_USER\",\"team\":\"gamma\"}" > rls-rules.json
-aws s3 cp rls-rules.json "s3://$BUCKET/rls/rules.json" && rm -f rls-rules.json
-```
-
-*Confirm:* open the **admin** dashboard (`...-cost-admin`) — it shows all teams'
-token usage immediately. The **team** dashboard (`...-cost`) shows only the
-teams you mapped in the RLS file. (A "data is restricted" message on the team
-dashboard means you haven't uploaded RLS rules yet — see "Two dashboards".)
-
-**I. Finish CUR — LATER (next day+), once AWS has caught up.** This is the step
-that lights up the **dollar** dashboard. **Steps A-H above are the whole
-same-day install.** After H, **try I.1 straight away** — it is a safe, idempotent
-command and also the "is it time yet?" gate. If the `iamPrincipal/team` key is
-already listed in your billing account it succeeds immediately (it did when we
-re-ran the README on an account that had used the tag before); if it errors
-"Tag keys not found", stop, wait, and come back later. Either way the remaining
-wait (the CUR delivering your post-activation usage) is around 24 hours.
-
-**The complete CUR order, start to finish** (this is the one sequence to
-follow; the "CUR 2.0 setup walkthrough" section further down holds the full
-commands for steps 1, 2 and 4 and is a reference, not a second procedure):
-
-1. **Step B (day 0)** — create the CUR bucket + export *with IAM principal data*
-   (walkthrough Steps 1-2).
-2. **Steps C-H (day 0)** — deploy and generate usage under `team`-tagged roles.
-3. **I.1 (day 1+)** — activate `iamPrincipal/team` (the command is just below).
-   **Retry until it succeeds** — failing with "Tag keys not found" means "not
-   yet", not "broken". When it succeeds, **generate usage again** (tags are not
-   retroactive).
-4. **I.2** — create/refresh the Glue table (walkthrough Step 4), then
-   **⛔ wait here:** re-run the Athena query until it returns real team names.
-   This waits on the CUR export delivering your post-activation usage to S3.
-5. **I.3 (only once that query returns team names)** — redeploy with the CUR
-   table (and CUR bucket) to add the **Billed Cost** sheet to both dashboards.
-
-Do the sub-steps strictly in order, and do **not** run the next one until its
-"wait here" check passes — each stage depends on AWS having propagated the
-previous one, and running ahead just produces an empty dashboard you'll have to
-debug.
-
----
-
-**I.1 — Activate the `iamPrincipal/team` cost-allocation tag. This command is
-also the "is it time yet?" gate.**
-
-> **The key is `iamPrincipal/team`, NOT `team`.** Bedrock attributes cost to the
-> calling IAM principal, and billing lists IAM-principal tags under an
-> `iamPrincipal/` prefix. Activating the bare key `team` fails with "Tag keys not
-> found: team" forever (it is a different key) — verified live. Also confirm your
-> CUR export was created with `INCLUDE_IAM_PRINCIPAL_DATA` (CUR Step 2), or the
-> tag can never appear in CUR.
->
-> **AWS Organizations:** AWS's guidance is that cost allocation tags are
-> activated in the **management (payer) account**; tagged usage from member
-> accounts then consolidates there. If your Bedrock account is a *member*
-> account, ask the management account's admin to run this activation. (Sources:
-> the [AWS Cost Management blog on IAM principal cost allocation](https://aws.amazon.com/blogs/aws-cloud-financial-management/track-amazon-bedrock-costs-by-caller-identity-with-iam-based-cost-allocation/)
-> and the [Architecture blog on Bedrock inference-profile cost tracking](https://aws.amazon.com/blogs/architecture/track-generative-ai-costs-with-amazon-bedrock-inference-profiles/).
-> The Bedrock user guide page itself does not state this. We verified activation
-> only from an account that *is* the management account; the member-account
-> case is unverified.)
-
-```bash
-aws ce update-cost-allocation-tags-status --region us-east-1 \
-  --cost-allocation-tags-status '[{"TagKey":"iamPrincipal/team","Status":"Active"}]'
-```
-
-- **Succeeds (no error / empty `Errors`)** → the tag is active. **Now generate
-  usage again** — re-run the step-F block
-  ([Step 1 — generate real Converse usage](#step-1--generate-real-converse-usage-per-team)).
-  AWS states cost allocation tags are **not retroactive: only costs incurred
-  after activation are tagged**, so the usage you generated *before* this point
-  will most likely show no `iamPrincipal/team` value in CUR. Usage generated
-  *after* activation will. Then go to I.2.
-- **Errors with `ValidationException ... Tag keys not found: iamPrincipal/team`**
-  → billing has not yet listed that key. Per the AWS docs, an IAM-principal tag
-  only becomes available to activate after the tagged principal has made at
-  least one Bedrock call, then can take up to ~24h to appear. Make sure step F
-  ran under a role that carries the `team` tag, then wait and re-run this exact
-  command. Re-running it is the "are we there yet?" loop.
-
-> The CLI surfaces an unknown key as a top-level `ValidationException`; the AWS
-> API reference example shows a per-entry `TagKeysNotFoundException` in an
-> `Errors` array. Both mean "not listed yet". See
-> [UpdateCostAllocationTagsStatus](https://docs.aws.amazon.com/aws-cost-management/latest/APIReference/API_UpdateCostAllocationTagsStatus.html),
-> [Using IAM principal for cost allocation](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/iam-principal-cost-allocation.html)
-> and [Activating user-defined cost allocation tags](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/activating-tags.html).
-
-Optional — confirm the tag shows `Active` (any iamPrincipal/* tag your account has
-seen is listed; only the ones you activate show `Active`):
-
-```bash
-aws ce list-cost-allocation-tags --region us-east-1 --tag-keys "iamPrincipal/team" \
-  --query "CostAllocationTags[].{Tag:TagKey,Status:Status}" --output table
-```
-
----
-
-**I.2 — Create the Glue table over the CUR data.** AWS does **not** auto-create
-one for CUR 2.0 Data Exports — you create it with a crawler (full commands under
-[CUR 2.0 setup walkthrough](#cur-20-setup-walkthrough-one-time-per-account),
-step 4). Result: `CUR_DATABASE_NAME=cur2_db`, `CUR_TABLE_NAME=data`, cataloged in the
-**stack** region over the us-east-1 CUR S3 data (cross-region read verified).
-
-**⛔ WAIT HERE until this query returns real team names.** CUR 2.0 puts
-IAM-principal tags in the `tags` **map** column under the key
-`iamPrincipal/team`, and only on line items for usage *after* I.1 succeeded. The
-CUR export delivers new files to S3 on its own schedule; allow around 24
-hours after your usage day for its rows (with their team values) to appear. To
-see when the last delivery happened:
-
-```bash
-aws bcm-data-exports list-exports --region us-east-1 \
-  --query "Exports[?ExportName=='bedrock-team-token-quota-cur2'].ExportStatus.LastRefreshedAt" --output text
-```
-
-Once a delivery newer than your post-activation usage day has landed, re-run
-this query (re-crawl first if you changed the export) until it returns
-non-blank teams:
-
-```bash
-# The analytics bucket is NOT a stack output; find it by name prefix:
-BUCKET=$(aws s3 ls | awk '{print $3}' | grep analyticsexportbucket)   # for Athena results
-aws athena start-query-execution --region "$AWS_REGION" \
-  --work-group bedrock-team-token-quota \
-  --query-execution-context Database=cur2_db \
-  --result-configuration "OutputLocation=s3://$BUCKET/athena-results/" \
-  --query-string "SELECT DISTINCT tags['iamPrincipal/team'] AS team
-                  FROM cur2_db.data
-                  WHERE line_item_product_code IN ('AmazonBedrock', 'AmazonBedrockService')"
-# ...then read the result:
-#   aws athena get-query-results --query-execution-id <id> \
-#     --query 'ResultSet.Rows[].Data[].VarCharValue' --output text
-#
-# Empty / all-blank  → the tag hasn't propagated into the data yet. WAIT and
-#                      re-run this query (do NOT proceed to I.3).
-# Real team names     → the column has landed → proceed to I.3.
-```
-
-> **Two Bedrock product codes.** Bedrock bills under both `AmazonBedrock`
-> (Nova, Llama, gpt-oss, ...) and `AmazonBedrockService` (Anthropic Claude,
-> including Mantle-served Claude). Verified on a live CUR 2.0 export: Claude was
-> ~99% of the dollars, so a filter on `AmazonBedrock` alone silently drops most
-> of the cost. The stack's `CurTeamCost` Lambda query matches both.
-> To see what your own CUR contains:
-> `SELECT line_item_product_code, line_item_usage_type, SUM(line_item_unblended_cost) FROM cur2_db.data WHERE lower(line_item_product_code) LIKE '%bedrock%' GROUP BY 1,2`
-
-> If the query errors with **"Column 'tags' cannot be resolved"**, the Glue
-> table doesn't have the column (e.g. it was crawled before the export changed).
-> Re-run the CUR
-> crawler ([CUR 2.0 setup walkthrough](#cur-20-setup-walkthrough-one-time-per-account),
-> step 4 / I.2) so Glue picks up the new schema, then re-run the check.
-
----
-
-**I.3 — Redeploy pointed at the CUR table.** Only do this once I.2's Athena
-query returns real team names. This creates the CUR cost Lambda + `cur_team_cost`
-table + the **Billed Cost** sheet on both QuickSight dashboards (team dashboard,
-row-level secured; admin dashboard, all teams):
-
-```bash
-# This runs a day or more after the install, usually in a NEW shell. Re-export
-# everything from the first deploy and step H, or the deploy will delete what
-# the missing variables switch on (see the rule above).
-export AWS_PROFILE=your-profile-name
-export AWS_REGION=us-east-2
-export TEST_ROLE_TRUSTED_PRINCIPAL_ARNS="arn:aws:iam::<account-id>:role/<your-sso-or-iam-principal>"
-export QUICKSIGHT_PRINCIPAL_ARN="arn:aws:quicksight:<home-region>:<account-id>:user/default/<your-qs-username>"   # same value as step H
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-
-export CUR_DATABASE_NAME="cur2_db"
-export CUR_TABLE_NAME="data"
-# REQUIRED: the S3 bucket your CUR export delivers to. Athena reads the CUR
-# files with the cost Lambda's own credentials, so the stack grants it read on
-# this bucket. Without it, synth fails fast with a clear message (and a Lambda
-# deployed without the grant fails with "not authorized to perform:
-# s3:ListBucket").
-export CUR_BUCKET_NAME="bedrock-cur2-export-$ACCT"
-
-npx cdk diff      # expect only ADDITIONS (cost Lambda, cur_team_cost table, Billed Cost
-                  # sheet + datasets). Any QuickSight resource marked [-] means
-                  # QUICKSIGHT_PRINCIPAL_ARN is missing: STOP and fix it.
-npx cdk deploy --require-approval never --outputs-file cdk-outputs.json
-```
-
-*Confirm:* run the cost Lambda once instead of waiting for its 6-hourly schedule,
-then open the **Billed Cost** sheet:
-
-```bash
-FN=$(aws lambda list-functions --query "Functions[?contains(FunctionName,'CurTeamCostFunction')].FunctionName" --output text)
-aws lambda invoke --function-name "$FN" --cli-binary-format raw-in-base64-out --payload '{}' out.json
-# A "FunctionError" in the response means it failed; otherwise it wrote
-# s3://<analyticsBucket>/cur-team-cost/dt=<today>/part-0.json
-```
-
-Each run writes **month-to-date** totals, and the dashboard shows only the latest
-day's file (the current billing period), so it never double-counts. Rows whose
-usage had no `iamPrincipal/team` tag appear under the team `UNTAGGED` (admin
-dashboard only; the team dashboard's row-level security hides them). Token
-counts on this sheet come from the bill: the CUR reports usage in thousands of
-tokens (`pricing_unit` = "1K tokens"), which the Lambda converts to real counts.
-Under the hood
-the `CurTeamCost` Lambda runs the same `tags['iamPrincipal/team']` query you
-just validated (`buildPerTeamCostQuery`), so if I.2's check returned real teams,
-the dashboard will too.
-
-> **Reality we observed on a clean account:** CUR Parquet reached S3 within ~1h,
-> but the `team` tag was still not catalogued and no CUR Glue table existed
-> hours later — so step I is genuinely a next-day task, and the Glue table is a
-> step **you** create (I.2), not something AWS registers for you.
-
-### Deploy the core stack
-
-This deploys real infrastructure: 6 DynamoDB tables, an S3 bucket, an SNS
-topic, 7+ Lambda functions with their own IAM roles, EventBridge rules, and
-a **custom resource that enables Bedrock Model Invocation Logging for the
-entire account/region** (a one-time account-level setting, not scoped to
-this stack — see "About Model Invocation Logging" below).
-
-```bash
-# Point your AWS credentials at the target account/region first, e.g.:
-export AWS_PROFILE=your-profile-name
-export AWS_REGION=us-east-1   # or wherever you want Bedrock usage tracked
-
-# Required: who is allowed to assume the Bedrock_Test_Role this stack
-# creates for the interactive CLI test tool. There is no default - deploy
-# will fail fast if this isn't set, rather than silently trusting every
-# principal in the account. Comma-separate multiple ARNs if needed.
-export TEST_ROLE_TRUSTED_PRINCIPAL_ARNS="arn:aws:iam::<account-id>:user/<your-username>"
-
-npm run infra:synth     # sanity-check the generated CloudFormation
-npm run infra:diff      # see exactly what will change before deploying
-npm run infra:deploy    # deploy
-```
-
-`infra:deploy` runs `cdk deploy` without `--require-approval never`, so it
-will show you the IAM/security-relevant changes and ask for confirmation
-before proceeding.
-
-By default, DynamoDB tables use `RemovalPolicy.DESTROY` (convenient for a
-sandbox — tearing down the stack removes the tables). If this becomes a
-persistent environment, pass `tableRemovalPolicy: RemovalPolicy.RETAIN` via
-stack props in `infra/bin/app.ts` before deploying to production.
+**To deploy, follow [DEPLOY.md](./DEPLOY.md).** It is the complete, ordered,
+CLI-only runbook: start the CUR export, deploy the core stack, allow models,
+set per-team token quotas, generate usage and verify enforcement, stand up both
+QuickSight dashboards (token-usage and CUR 2.0 billed-dollar), verify, and tear
+down. This README is the *reference* (what it is and how it works); DEPLOY.md is
+the *procedure* (how to deploy it).
+
+**What the stack deploys:** 6 DynamoDB tables, an S3 bucket, an SNS topic, 7+
+Lambda functions (each with its own least-privilege IAM role), EventBridge
+rules, a Cognito user pool for the Budget UI, and a **custom resource that
+enables Bedrock Model Invocation Logging for the entire account/region** (a
+one-time account-level setting — see
+[About Model Invocation Logging](#about-model-invocation-logging)). The
+QuickSight dashboards and the CUR cost Lambda are **opt-in**, created only when
+you pass the relevant stack props / env vars (see DEPLOY.md).
+
+> **Production hardening.** By default DynamoDB tables use `RemovalPolicy.DESTROY`
+> (convenient for a sandbox — teardown removes the tables and their data). For a
+> persistent environment, pass `tableRemovalPolicy: RemovalPolicy.RETAIN` via
+> stack props in `infra/bin/app.ts` before deploying to production. See also
+> [Security notes](#security-notes).
 
 ### QuickSight dashboards (optional) — and the region gotcha
 
@@ -636,36 +272,10 @@ principal ARN to create the dashboards.
 > with *"Access denied when writing to location: s3://…/athena-results/…"*. The
 > grant below includes both the data read and the Athena-results write.
 
-The exact one-time grant (substitute your analytics bucket name — the
-`AnalyticsExportBucket` physical id from `cdk-outputs.json` / the stack's
-resources):
-
-```bash
-export AWS_PROFILE=...          # your admin profile
-BUCKET=<your analytics bucket name>
-
-aws iam put-role-policy --role-name aws-quicksight-service-role-v0 \
-  --policy-name BedrockTeamTokenQuotaAnalyticsBucketAccess \
-  --policy-document "{
-    \"Version\":\"2012-10-17\",
-    \"Statement\":[
-      {
-        \"Sid\":\"ReadAnalyticsData\",
-        \"Effect\":\"Allow\",
-        \"Action\":[\"s3:GetObject\",\"s3:ListBucket\",\"s3:GetBucketLocation\"],
-        \"Resource\":[\"arn:aws:s3:::$BUCKET\",\"arn:aws:s3:::$BUCKET/*\"]
-      },
-      {
-        \"Sid\":\"WriteAthenaResults\",
-        \"Effect\":\"Allow\",
-        \"Action\":[\"s3:PutObject\",\"s3:AbortMultipartUpload\"],
-        \"Resource\":[\"arn:aws:s3:::$BUCKET/athena-results/*\"]
-      }
-    ]
-  }"
-```
-
-Remove this grant at teardown (see "Tearing it down").
+The exact `aws iam put-role-policy` grant — two statements on
+`aws-quicksight-service-role-v0`: **read** on the analytics bucket and
+`s3:PutObject` on `athena-results/` — and its removal at teardown, are in
+**[DEPLOY.md → Part 6](./DEPLOY.md#part-6--token-usage-quicksight-dashboards)**.
 
 #### Two dashboards: admin (all teams) vs team (row-level security)
 
@@ -700,37 +310,13 @@ matching rule means no visible rows (the "data is restricted" message). This is
 why the admin dashboard (a separate dataset with **no**
 `rowLevelPermissionDataSet`) shows everything regardless of rules.
 
-```bash
-BUCKET=<your analytics bucket name>
-# Your QuickSight username — for IAM-federated/SSO users it's the full name,
-# e.g. "AWSReservedSSO_<permset>_<id>/you@example.com". Find it with:
-#   aws quicksight list-users --aws-account-id <acct> --namespace default --region <home-region>
-QS_USER="<your quicksight username>"
-
-# One JSON object PER LINE (the Glue table uses a JSON SerDe = newline-delimited).
-# Map a user to each team they may see. An admin who should see everything on
-# the team dashboard gets one row per team; a team lead gets just their team.
-printf '%s\n' \
-  "{\"username\":\"$QS_USER\",\"team\":\"alpha\"}" \
-  "{\"username\":\"$QS_USER\",\"team\":\"beta\"}" \
-  "{\"username\":\"$QS_USER\",\"team\":\"gamma\"}" > rls-rules.json
-
-aws s3 cp rls-rules.json "s3://$BUCKET/rls/rules.json"
-rm -f rls-rules.json
-```
-
-The datasets are DIRECT_QUERY over Athena, so the rules take effect on the next
-dashboard load — no ingestion/refresh step. Verify Athena sees the rules:
-
-```bash
-# Expect one row per (username, team) pair you uploaded.
-aws athena start-query-execution \
-  --query-string "SELECT username, team FROM bedrock_team_token_quota.team_access" \
-  --work-group bedrock-team-token-quota \
-  --query-execution-context Database=bedrock_team_token_quota \
-  --result-configuration "OutputLocation=s3://$BUCKET/athena-results/"
-# ...then `aws athena get-query-results --query-execution-id <id>`.
-```
+The commands to upload the newline-delimited `{username, team}` rules file (one
+JSON object per line) and verify Athena sees it are in
+**[DEPLOY.md → Part 6d](./DEPLOY.md#part-6--token-usage-quicksight-dashboards)**.
+Map each user to the team(s) they may see — a team lead gets just their team; an
+admin who should see everything on the team dashboard gets one row per team. The
+datasets are DIRECT_QUERY over Athena, so rules take effect on the next
+dashboard load — no ingestion/refresh step.
 
 > **In short:** if the team dashboard says "data is restricted," you haven't
 > uploaded RLS rules yet. The admin dashboard needs no rules. This was verified
@@ -769,130 +355,12 @@ real Bedrock traffic before deploying broadly. See the
 
 ### Tearing it down
 
-A full teardown has **three parts**, in order: (A) prerequisites that must be
-cleared before `cdk destroy` will succeed, (B) `cdk destroy` itself, and
-(C) resources created *outside* the stack that `cdk destroy` never touches.
-The steps below are the exact sequence, including the two gotchas that make a
-naive `cdk destroy` fail.
-
-Set your shell first:
-
-```bash
-export AWS_PROFILE=your-profile-name
-export AWS_REGION=us-east-2          # the region you deployed to
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-```
-
-#### Part A — clear the two things that block `cdk destroy`
-
-CloudFormation refuses to delete a non-empty S3 bucket or a non-empty Athena
-workgroup. Both will be non-empty after any real use, so clear them first.
-
-```bash
-# 1. Empty both S3 buckets. The analytics bucket has autoDeleteObjects, but the
-#    model-invocation-log bucket does NOT auto-empty — emptying both is safe.
-#    Find the exact names from the stack outputs (or the S3 console):
-LOG_BUCKET=$(aws cloudformation describe-stacks --stack-name BedrockTeamTokenQuotaStack \
-  --query "Stacks[0].Outputs[?OutputKey=='ModelInvocationLogBucketNameOutput'].OutputValue" --output text)
-aws s3 rm "s3://$LOG_BUCKET" --recursive
-# The analytics bucket name isn't a stack output; find it by prefix:
-for b in $(aws s3 ls | awk '{print $3}' | grep analyticsexportbucket); do
-  aws s3 rm "s3://$b" --recursive
-done
-
-# 2. Delete the Athena workgroup WITH its saved queries. cdk destroy fails with
-#    "WorkGroup ... is not empty" otherwise, because CloudFormation will not
-#    force-delete a workgroup that has query history.
-aws athena delete-work-group --work-group bedrock-team-token-quota --recursive-delete-option
-```
-
-#### Part B — destroy the stack
-
-```bash
-# TEST_ROLE_TRUSTED_PRINCIPAL_ARNS must still be set (the app reads it on synth).
-export TEST_ROLE_TRUSTED_PRINCIPAL_ARNS="arn:aws:iam::$ACCOUNT_ID:user/<your-username>"
-npx cdk destroy --force    # --force skips the interactive y/n prompt (needed in scripts)
-```
-
-This removes everything the stack created: all DynamoDB tables (**and their
-data** — quotas, usage, audit, blocked-state, registry, mappings), both S3
-buckets, every Lambda + IAM role, the Cognito User Pool (**your admin login
-user is deleted**), the QuickSight datasets/dashboards, the Glue database/
-tables, EventBridge rules, and the SNS topic. It also **disables the account/
-region Model Invocation Logging** configuration the stack enabled (best-effort;
-a prior configuration is not restored).
-
-> If `cdk destroy` still reports `DELETE_FAILED` on the Athena workgroup or an
-> S3 bucket, it means that resource was repopulated between Part A and Part B
-> (e.g. a scheduled Lambda ran once more). Re-run the matching Part A command,
-> then `npx cdk destroy` again.
-
-#### Part C — remove out-of-band resources (NOT part of the stack)
-
-These were created by the test tooling / cost-dashboard / CUR setup steps and
-live outside CloudFormation, so `cdk destroy` leaves them behind:
-
-```bash
-# 1. Sample/test team roles you created out-of-band (only if you did):
-#      - SampleTeamRole-alpha/beta/gamma  — the reconcile-sweep + usage demos
-#      - TokenQuotaTestRole-*             — older interactive-test-tool roles
-#    (The stack-managed Bedrock_Test_Role is NOT here — cdk destroy removes it.)
-for R in $(aws iam list-roles \
-    --query "Roles[?starts_with(RoleName,'SampleTeamRole') || starts_with(RoleName,'TokenQuotaTestRole')].RoleName" \
-    --output text); do
-  for P in $(aws iam list-role-policies --role-name "$R" --query "PolicyNames" --output text); do
-    aws iam delete-role-policy --role-name "$R" --policy-name "$P"
-  done
-  aws iam delete-role --role-name "$R"
-done
-
-# 2. QuickSight S3 access grant (added to let QuickSight read the Athena
-#    results bucket — only if you enabled QuickSight dashboards):
-aws iam delete-role-policy --role-name aws-quicksight-service-role-v0 \
-  --policy-name BedrockTeamTokenQuotaAnalyticsBucketAccess 2>/dev/null || true
-
-# 3. CUR 2.0 export + its delivery bucket (us-east-1 only — only if you set up
-#    cost dashboards per the CUR walkthrough):
-CUR_ARN=$(aws bcm-data-exports list-exports --region us-east-1 \
-  --query "Exports[?Name=='bedrock-team-token-quota-cur2'].ExportArn" --output text)
-[ -n "$CUR_ARN" ] && aws bcm-data-exports delete-export --region us-east-1 --export-arn "$CUR_ARN"
-CUR_BUCKET="bedrock-cur2-export-$ACCOUNT_ID"
-aws s3 rm "s3://$CUR_BUCKET" --recursive --region us-east-1 2>/dev/null || true
-aws s3api delete-bucket --bucket "$CUR_BUCKET" --region us-east-1 2>/dev/null || true
-# Optional: deactivate the team cost-allocation tag (ignore "Tag keys not
-# found" — that just means it never activated).
-aws ce update-cost-allocation-tags-status --region us-east-1 \
-  --cost-allocation-tags-status '[{"TagKey":"iamPrincipal/team","Status":"Inactive"}]' 2>/dev/null || true
-
-# 3b. The CUR Glue catalog objects from CUR Step 4 (also outside the stack):
-aws glue delete-crawler --region "$AWS_REGION" --name bedrock-cur2-crawler 2>/dev/null || true
-aws glue delete-database --region "$AWS_REGION" --name cur2_db 2>/dev/null || true
-aws iam delete-role-policy --role-name BedrockCur2CrawlerRole --policy-name CurS3Read 2>/dev/null || true
-aws iam detach-role-policy --role-name BedrockCur2CrawlerRole --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole 2>/dev/null || true
-aws iam delete-role --role-name BedrockCur2CrawlerRole 2>/dev/null || true
-
-# 4. Watch for ORPHANED buckets from earlier stack versions. A stack
-#    replacement can leave old model-invocation-log buckets behind (they match
-#    the same prefix but aren't in the current stack). List and remove any:
-aws s3 ls | awk '{print $3}' | grep -E 'bedrockteamtokenquota|bedrock-cur2'
-# ...then for each stray bucket: aws s3 rm s3://<name> --recursive && aws s3api delete-bucket --bucket <name>
-```
-
-#### Part D — local artifacts
-
-```bash
-rm -f cdk-outputs.json web/.env   # regenerated on the next deploy
-```
-
-#### Verify a clean account
-
-```bash
-aws s3 ls | grep -E 'bedrockteamtokenquota|bedrock-cur2'                     # expect no output
-aws iam list-roles --query "Roles[?starts_with(RoleName,'SampleTeamRole') || starts_with(RoleName,'TokenQuotaTestRole')].RoleName" --output text  # empty
-aws cognito-idp list-user-pools --max-results 20 \
-  --query "UserPools[?Name=='bedrock-team-token-quota-admins'].Id" --output text   # empty
-aws glue get-databases --query "DatabaseList[?Name=='bedrock_team_token_quota'].Name" --output text   # empty
-```
+See **[DEPLOY.md → Part 9](./DEPLOY.md#part-9--tear-it-down)** for the full
+teardown: empty the stack buckets, delete the Athena workgroup, `cdk destroy`,
+then remove the out-of-band resources (sample roles, the QuickSight S3 grant,
+the CUR Glue catalog). It also shows how to **keep the CUR export and the
+`iamPrincipal/team` cost-allocation tag** so you don't re-pay the ~1-2 day CUR
+clock on a later redeploy.
 
 ### About Model Invocation Logging
 
@@ -1448,9 +916,9 @@ aws dynamodb scan --table-name Team_Role_Cache --projection-expression "PK,team"
 ```
 
 To also exercise **enforcement/usage** (real Bedrock traffic, quotas, deny
-policies, dashboards) rather than just the mapping, use the fuller
-"generate real Converse usage" walkthrough further below, which assumes a
-tagged role and sends live `Converse` calls.
+policies, dashboards) rather than just the mapping, follow
+**[DEPLOY.md → Part 5](./DEPLOY.md#part-5--generate-team-tagged-usage-and-verify-enforcement)**,
+which creates tagged roles and sends live `Converse` calls.
 
 > **Clean up the sample roles when done** (they are out-of-band — the stack
 > does not manage them, so `cdk destroy` will not remove them):
@@ -1662,205 +1130,16 @@ Those carry token counts only — no cost.
 
 ### CUR 2.0 setup walkthrough (one-time, per account)
 
-**CUR 2.0 is an AWS account prerequisite, not part of installing this
-solution.** Many organizations already run a CUR 2.0 export for FinOps — if
-yours does, you don't set anything up here; you just point the stack at the
-existing Glue table (step 4). If your account does *not* have one yet, enabling
-it is an **account-level task you own**, and it is **independent of deploying
-this solution**:
-
-- **You do not wait on CUR to use the product.** Token tracking, quota
-  enforcement, and the token-usage dashboards all work the moment the core
-  stack is deployed. CUR adds only the *dollar* view.
-- **Do these in parallel.** Do Steps 1-2 below first (the export has a
-  first-delivery lag that is entirely AWS-side), and meanwhile deploy the
-  solution and start using it. **The order to follow, with the wait gates, is
-  step I of the [A-Z walkthrough](#full-deploy-and-test-walkthrough-a-z-in-order)**
-  — this section just holds the commands for Steps 1, 2 and 4.
-- Because the tag activation (step I.1) requires billing to have already seen a
-  Bedrock call from a `team`-tagged role, the realistic cold-start for the
-  dollar view is **about 1-2 days** on a brand-new account — all AWS-side waiting,
-  not solution setup. On an account that already has CUR + the tag active, it's
-  effectively immediate (just Step 4 and the redeploy).
-
-The steps below are the exact CLI (the same can be done in the AWS Billing
-console). This stack does **not** create the CUR export — you own it.
-
-> **Important:** The BCM Data Exports API (`bcm-data-exports`) runs in
-> **us-east-1 only**, regardless of where you deploy the stack. CUR data is
-> account-global and queryable from any region via Athena once the Glue table
-> exists.
-
-**Step 1 — Create an S3 bucket for CUR delivery and apply the required
-policy:**
-
-```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-CUR_BUCKET="bedrock-cur2-export-$ACCOUNT_ID"
-
-# Create the bucket (in us-east-1, the Data Exports region)
-aws s3api create-bucket --bucket "$CUR_BUCKET" --region us-east-1
-
-# Apply the required bucket policy so Data Exports can write to it
-aws s3api put-bucket-policy --bucket "$CUR_BUCKET" --region us-east-1 --policy "{
-  \"Version\":\"2012-10-17\",
-  \"Statement\":[{
-    \"Sid\":\"EnableAWSDataExportsToWriteToS3\",
-    \"Effect\":\"Allow\",
-    \"Principal\":{\"Service\":[\"bcm-data-exports.amazonaws.com\"]},
-    \"Action\":[\"s3:PutObject\"],
-    \"Resource\":\"arn:aws:s3:::$CUR_BUCKET/*\",
-    \"Condition\":{
-      \"ArnLike\":{\"aws:SourceArn\":\"arn:aws:bcm-data-exports:us-east-1:$ACCOUNT_ID:export/*\"},
-      \"StringEquals\":{\"aws:SourceAccount\":\"$ACCOUNT_ID\"}
-    }
-  }]
-}"
-```
-
-For the bucket policy specification, see
-[Setting up an S3 bucket for data exports](https://docs.aws.amazon.com/cur/latest/userguide/dataexports-s3-bucket.html).
-
-**Step 2 — Create the CUR 2.0 Data Export:**
-
-```bash
-# Get all CUR 2.0 column names (builds the SELECT query automatically).
-# --table-properties INCLUDE_IAM_PRINCIPAL_DATA=TRUE is REQUIRED: without it the
-# column list omits line_item_iam_principal (115 columns vs 116), and the export
-# cannot carry per-team data for Bedrock.
-COLS=$(aws bcm-data-exports get-table --table-name COST_AND_USAGE_REPORT \
-  --table-properties INCLUDE_IAM_PRINCIPAL_DATA=TRUE \
-  --query "Schema[].Name" --output text --region us-east-1)
-SELECT_ALL=$(echo "$COLS" | tr '\t' ',')
-
-# Create the export (this produces a JSON definition inline — the Python
-# one-liner makes it readable, but you can also use the console)
-python3 -c "
-import json, sys
-bucket, acct, cols = sys.argv[1], sys.argv[2], sys.argv[3]
-print(json.dumps({
-  'Name': 'bedrock-team-token-quota-cur2',
-  'Description': 'CUR 2.0 export for bedrock-team-token-quota cost dashboards',
-  'DataQuery': {
-    'QueryStatement': f'SELECT {cols} FROM COST_AND_USAGE_REPORT',
-    'TableConfigurations': {
-      'COST_AND_USAGE_REPORT': {
-        'TIME_GRANULARITY': 'DAILY',
-        'INCLUDE_RESOURCES': 'TRUE',
-        'INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY': 'FALSE',
-        'INCLUDE_SPLIT_COST_ALLOCATION_DATA': 'FALSE',
-        'INCLUDE_IAM_PRINCIPAL_DATA': 'TRUE'
-      }
-    }
-  },
-  'DestinationConfigurations': {
-    'S3Destination': {
-      'S3Bucket': bucket, 'S3Prefix': 'cur2', 'S3Region': 'us-east-1',
-      'S3OutputConfigurations': {
-        'OutputType': 'CUSTOM', 'Format': 'PARQUET',
-        'Compression': 'PARQUET', 'Overwrite': 'OVERWRITE_REPORT'
-      }
-    }
-  },
-  'RefreshCadence': {'Frequency': 'SYNCHRONOUS'}
-}))
-" "$CUR_BUCKET" "$ACCOUNT_ID" "$SELECT_ALL" > /tmp/cur-export.json
-
-aws bcm-data-exports create-export --export "file:///tmp/cur-export.json" --region us-east-1
-```
-
-For full details, see
-[Creating a CUR 2.0 export](https://docs.aws.amazon.com/cur/latest/userguide/data-exports-migrate-two.html)
-and
-[Using IAM principal for cost allocation](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/iam-principal-cost-allocation.html).
-
-**Already created the export without IAM principal data?** AWS's
-[IAM principal attribution](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-mgmt-iam-principal-tracking.html)
-page says to **create a new export** with the caller-identity option: existing
-exports do not retroactively include identity data. Re-run Step 2 above to create
-a new export (with a new name and `S3Prefix`), then point the Glue crawler at
-that prefix.
-
-**Step 3 — Activate the `iamPrincipal/team` cost-allocation tag.** This is
-**step I.1** of the A-Z walkthrough — the command, the retry logic and the
-caveats (prefixed key, Organizations, not retroactive) live there so there is
-exactly one copy. Don't run it here: it fails until your tagged roles have made
-a Bedrock call.
-
-For background, see
-[Activating user-defined cost allocation tags](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/activating-tags.html)
-and
-[Understanding Bedrock cost allocation tags in CUR](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-mgmt-understanding-cur-data.html#cost-allocation-tags-in-cur).
-
-**Step 4 — Create a Glue table over the CUR, then point the stack at it.**
-
-This stack reads CUR **through Athena**, which needs a **Glue table** over the
-CUR Parquet. There are two situations:
-
-- **You already run CUR with Athena/Glue integration** (common for existing
-  FinOps setups): you already have a Glue database + table. Skip to the
-  redeploy at the end of this step and pass their names.
-- **You created the export with the §Step 2 command above** (or otherwise have
-  no Glue table): **AWS does NOT auto-create one.** CUR 2.0 Data Exports write
-  only the Parquet + a manifest to S3 — there is no Glue table until you make
-  one. (This was verified live: hours after first delivery, no CUR Glue
-  database existed.) Create it once with a Glue crawler:
-
-```bash
-export AWS_REGION=us-east-2            # your STACK region — catalog the table here
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-CUR_BUCKET="bedrock-cur2-export-$ACCT"   # the CUR bucket (physically us-east-1; S3 is global)
-
-# 4a. A Glue database (in the stack region) to hold the CUR table.
-aws glue create-database --region "$AWS_REGION" \
-  --database-input '{"Name":"cur2_db","Description":"CUR 2.0 raw export table for bedrock-team-token-quota"}'
-
-# 4b. A minimal IAM role the crawler assumes (Glue service policy + read on the CUR bucket).
-aws iam create-role --role-name BedrockCur2CrawlerRole \
-  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"glue.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-aws iam attach-role-policy --role-name BedrockCur2CrawlerRole \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
-aws iam put-role-policy --role-name BedrockCur2CrawlerRole --policy-name CurS3Read \
-  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:ListBucket\"],\"Resource\":[\"arn:aws:s3:::$CUR_BUCKET\",\"arn:aws:s3:::$CUR_BUCKET/*\"]}]}"
-sleep 10   # let the new role propagate
-
-# 4c. A crawler (in the stack region) pointed at the CUR data prefix (in us-east-1 S3).
-aws glue create-crawler --region "$AWS_REGION" --name bedrock-cur2-crawler \
-  --role "arn:aws:iam::$ACCT:role/BedrockCur2CrawlerRole" --database-name cur2_db \
-  --targets "{\"S3Targets\":[{\"Path\":\"s3://$CUR_BUCKET/cur2/bedrock-team-token-quota-cur2/data/\"}]}"
-aws glue start-crawler --region "$AWS_REGION" --name bedrock-cur2-crawler
-
-# 4d. Wait for it to finish (State returns to READY), then confirm the table:
-aws glue get-crawler --region "$AWS_REGION" --name bedrock-cur2-crawler --query "Crawler.State" --output text
-aws glue get-tables --region "$AWS_REGION" --database-name cur2_db --query "TableList[].Name" --output text
-#  -> prints "data"  (the crawler names the table after the S3 prefix). You now
-#     have CUR_DATABASE_NAME=cur2_db and CUR_TABLE_NAME=data, both in the stack
-#     region, cataloging the us-east-1 CUR S3 data (cross-region S3 read works —
-#     verified with a live Athena query).
-```
-
-Then redeploy the stack with the CUR props, exactly as in **step I.3** of the
-A-Z walkthrough (it lists every variable a redeploy needs, including
-`QUICKSIGHT_PRINCIPAL_ARN`; a redeploy missing it deletes the dashboards).
-
-> **Per-team dollars still wait on the `iamPrincipal/team` tag (step I.1).** Even
-> with the Glue table and the redeploy done, the CUR cost Lambda groups cost by
-> `tags['iamPrincipal/team']` — which CUR only populates **after** the tag is
-> activated (step I.1) and billing processes usage under it (around 24h). Until then
-> the pipeline is wired correctly but the per-team cost visual is empty.
-> (Verified live: Bedrock line items were present in CUR within the hour, with
-> no tag keys on them yet.)
-
-Omit `CUR_DATABASE_NAME` / `CUR_TABLE_NAME` / `CUR_BUCKET_NAME` and the stack skips the CUR cost
-Lambda entirely — token tracking and enforcement still work fully; only the
-dollar cost dashboards have no data.
-
-Clean up the crawler + its role at teardown:
-`aws glue delete-crawler --name bedrock-cur2-crawler --region <stack-region>`,
-`aws glue delete-database --name cur2_db --region <stack-region>`,
-`aws iam delete-role-policy --role-name BedrockCur2CrawlerRole --policy-name CurS3Read`,
-`aws iam detach-role-policy --role-name BedrockCur2CrawlerRole --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole`,
-`aws iam delete-role --role-name BedrockCur2CrawlerRole`.
+**CUR 2.0 is an AWS account prerequisite, not part of installing this solution**
+— many orgs already run a CUR 2.0 export for FinOps. The step-by-step CLI
+(create the export **with IAM principal data**, activate the `iamPrincipal/team`
+cost-allocation tag, catalog the CUR in Glue, point the stack at it) lives in the
+deploy runbook:
+**[DEPLOY.md → Part 1](./DEPLOY.md#part-1--start-the-cur-20-export-do-this-first)**
+(create the export — do this first) and
+**[Part 7](./DEPLOY.md#part-7--dollar-dashboards-from-cur-20-next-day)** (activate
+the tag, catalog, redeploy). The ownership/access model and what the integration
+adds are the two subsections above.
 
 ### Bedrock cost management references
 
@@ -1894,156 +1173,14 @@ following documentation informed the design:
 
 ## Generating sample usage data for the dashboards
 
-The QuickSight dashboards show **token usage** (from the pipeline) and
-**billed cost** (from CUR 2.0, if configured). This section walks through
-producing real usage across several teams and models, for both the **Converse**
-(`bedrock-runtime`) and **Mantle** (`bedrock-mantle`) endpoints.
-
-Two things need to happen for data to appear:
-
-1. **Token usage** — real Bedrock calls under team-tagged roles (within minutes).
-2. **An analytics export run** — writes token-usage rows to S3 where Athena/
-   QuickSight read them (runs hourly on a schedule, or invoke it on demand).
-
-For the dollar-cost view, CUR 2.0 must be configured and the `team` cost
-allocation tag activated (see above). CUR cost lags ~24h behind the actual
-calls, so tokens appear in the dashboards before dollars do — that's expected.
-
-Set your shell up first:
-
-```bash
-export AWS_PROFILE=your-profile-name
-export AWS_REGION=us-east-2            # match your deployment
-```
-
-### Step 1 — generate real Converse usage (per team)
-
-Each team is the `team` tag on an IAM role (see "How it works"). To attribute
-usage to a team, you create a role tagged with that team name, give it
-permission to invoke Bedrock, assume it, and call `Converse`. Usage made under
-that role flows through the pipeline tagged with its team, and (once CUR is
-active) its cost is attributed to that team too.
-
-The block below is **copy-paste runnable** — it derives your account id and
-your own principal ARN, creates three team roles (`alpha`/`beta`/`gamma`), and
-sends 3 real Converse calls through each. It is exactly what the maintainers
-run to populate a fresh deployment's dashboards.
-
-```bash
-export AWS_PROFILE=your-profile-name
-export AWS_REGION=us-east-2                     # match your deployment
-MODEL=amazon.nova-lite-v1:0                     # a model you have access to in that region
-
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-ME=$(aws sts get-caller-identity --query Arn --output text)   # your principal, trusted to assume the roles
-INVOKE='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["bedrock:InvokeModel","bedrock:InvokeModelWithResponseStream","bedrock:Converse","bedrock:ConverseStream"],"Resource":["arn:aws:bedrock:*::foundation-model/*","arn:aws:bedrock:*:*:inference-profile/*"]}]}'
-
-# 1) Create (or update) one tagged, assumable, Bedrock-invoking role per team.
-for T in alpha beta gamma; do
-  aws iam create-role --role-name "SampleTeamRole-$T" \
-    --assume-role-policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"$ME\"},\"Action\":\"sts:AssumeRole\"}]}" \
-    --tags Key=team,Value=$T 2>/dev/null || true
-  aws iam tag-role --role-name "SampleTeamRole-$T" --tags Key=team,Value=$T
-  aws iam put-role-policy --role-name "SampleTeamRole-$T" --policy-name BedrockInvoke --policy-document "$INVOKE"
-done
-sleep 10   # let the new role trust/policy propagate before assuming
-
-# 2) Assume each role and send real Converse calls through it. Isolating the
-#    assumed creds with `env -u AWS_PROFILE ...` is REQUIRED — otherwise the SDK
-#    may sign with your base profile and the usage is attributed to the wrong
-#    principal (or you get InvalidSignatureException).
-for T in alpha beta gamma; do
-  CREDS=$(aws sts assume-role --role-arn "arn:aws:iam::$ACCT:role/SampleTeamRole-$T" \
-    --role-session-name "usage-$T" --query Credentials --output json)
-  AKI=$(echo "$CREDS" | python -c "import sys,json;print(json.load(sys.stdin)['AccessKeyId'])")
-  SAK=$(echo "$CREDS" | python -c "import sys,json;print(json.load(sys.stdin)['SecretAccessKey'])")
-  STK=$(echo "$CREDS" | python -c "import sys,json;print(json.load(sys.stdin)['SessionToken'])")
-  for i in 1 2 3; do
-    env -u AWS_PROFILE AWS_ACCESS_KEY_ID=$AKI AWS_SECRET_ACCESS_KEY=$SAK AWS_SESSION_TOKEN=$STK \
-      aws bedrock-runtime converse --region "$AWS_REGION" --model-id "$MODEL" \
-      --messages "[{\"role\":\"user\",\"content\":[{\"text\":\"Write ~200 words on event-driven architecture, example $i for team $T.\"}]}]" \
-      --inference-config '{"maxTokens":600}' --query usage.totalTokens --output text
-  done
-done
-```
-
-Each call prints the token count it consumed. Within a few minutes those land
-in `Usage_Aggregation` as per-team rows (verify in Step 3). The **dollar** cost
-for the same calls appears later, once CUR 2.0 is active and has delivered
-(~24h) — see the CUR note below.
-
-> **The `iamPrincipal/team` cost-allocation tag is activated *after* this usage.**
-> Per the AWS docs, an IAM-principal tag only becomes available to activate once
-> the tagged role has made a Bedrock call. So the order is: generate
-> team-tagged usage (this step) → activate `iamPrincipal/team` (step I.1;
-> retry if it isn't listed yet) → wait for CUR to populate. The token
-> dashboards, by contrast, show this usage within minutes.
-
-### Step 2 — generate Mantle usage (if your account/region has Mantle)
-
-Mantle has no per-request log; usage is pulled from `AWS/BedrockMantle`
-CloudWatch metrics (`TotalInputTokens`/`TotalOutputTokens`, dimensioned by
-`Project` and `ModelId`) and attributed to a team via a Team↔Project mapping.
-So for Mantle you must (1) map the project to a team and (2) generate real
-Mantle traffic under that project:
-
-```bash
-aws lambda invoke --function-name "$ADMIN_FN" --cli-binary-format raw-in-base64-out \
-  --payload '{"operation":"putTeamProjectMapping","payload":{"projectId":"<your-mantle-project-id>","team":"alpha"}}' out.json
-# ...then invoke the Mantle model under that project so AWS/BedrockMantle metrics appear.
-```
-
-> **Mantle availability varies by account/region.** If
-> `aws cloudwatch list-metrics --namespace AWS/BedrockMantle` returns nothing,
-> the Mantle endpoint isn't emitting metrics in your account — in that case a
-> model that happens to be OpenAI/open-weight is still served through the
-> normal Converse endpoint, and you should register it as `bedrock-runtime`
-> and generate usage via Step 1. There's no way to fabricate
-> `AWS/BedrockMantle` data; it only exists from real Mantle invocations.
-
-### Step 3 — export and view
-
-Token usage lands in `Usage_Aggregation` within a few minutes of each
-Converse call (see the latency note above); Mantle totals refresh every 15
-minutes. Once usage is recorded, run the analytics export (it also runs
-hourly on its own):
-
-First, confirm the pipeline recorded the per-team counters (this is the proof
-that team attribution worked, before any export/dashboard):
-
-```bash
-aws dynamodb scan --table-name Usage_Aggregation \
-  --projection-expression "PK,SK,inputTokens,outputTokens" --output json \
-  --region "$AWS_REGION"
-# Expect rows like PK = "TEAM#alpha#MODEL#amazon.nova-lite-v1:0", SK = "DAY#<today>".
-# A call made WITHOUT a team-tagged role shows up as TEAM#UNMAPPED#... — that's
-# correct behavior, not an error.
-```
-
-Then run the analytics export (it also runs hourly on its own) to publish the
-rows to the analytics bucket where QuickSight reads them:
-
-```bash
-EXPORT_FN=$(aws lambda list-functions \
-  --query "Functions[?contains(FunctionName,'AnalyticsExportFunction')].FunctionName" --output text)
-aws lambda invoke --function-name "$EXPORT_FN" --cli-binary-format raw-in-base64-out --payload '{}' out.json
-```
-
-Verify the exported token-usage rows:
-
-```bash
-BUCKET=<analytics bucket name from cdk outputs>   # the AnalyticsExportBucket physical id
-aws s3 cp "s3://$BUCKET/token-usage/dt=$(date -u +%Y-%m-%d)/part-0.json" -
-# Each line is one {team, model, usageDay, endpoint, inputTokens, outputTokens,
-# cacheReadTokens, cacheWriteTokens, totalTokens} row — the exact shape the
-# QuickSight `token_usage` dataset queries.
-```
-
-Then open the QuickSight dashboards (team dashboard = per-team RLS; admin
-dashboard = all teams). The datasets are DIRECT_QUERY over Athena, so they
-reflect the latest export on refresh — no SPICE ingestion step. The token
-dashboards show usage immediately. For dollar cost, the `cur-team-cost/`
-dataset populates after CUR 2.0 delivers data (~24h after the calls).
+To populate the dashboards on a fresh deploy, generate team-tagged usage as in
+**[DEPLOY.md → Part 5](./DEPLOY.md#part-5--generate-team-tagged-usage-and-verify-enforcement)**
+(create a few `team`-tagged roles, send real `Converse` calls), then run the
+analytics export (**[Part 6a](./DEPLOY.md#part-6--token-usage-quicksight-dashboards)**).
+Usage from a role with no `team` tag is bucketed as `TEAM#UNMAPPED#…` — correct,
+not an error. Mantle has no per-request log; its usage comes from real Mantle
+invocations (see
+[How a budget maps to Converse vs Mantle](#how-a-budget-maps-to-converse-vs-mantle)).
 
 ## Known limitations / follow-ups
 
