@@ -1055,6 +1055,21 @@ There is deliberately **no rate card** and no `tokens × rate` estimation. A
 derived estimate would only ever approximate a number CUR already provides
 exactly, so cost reporting reads CUR directly.
 
+> **Why some cost shows up as `UNTAGGED` (and how it differs from `UNMAPPED`).**
+> The Billed Cost view groups by the `iamPrincipal/team` tag in CUR. A line item
+> has **no** team value — bucketed as `UNTAGGED` — for either of two reasons:
+> (a) the calling role had no `team` tag, **or** (b) the usage was billed
+> *before* the tag was activated. **Cost-allocation tags are not retroactive**,
+> so all pre-activation Bedrock spend stays `UNTAGGED` even if the role carried a
+> `team` tag at the time — on a fresh install your entire history is `UNTAGGED`,
+> and only usage billed *after* activation attributes to a team. (The line
+> item still records the caller in `line_item_iam_principal`, so you can group
+> historical spend by principal even when the team tag is absent.) This is
+> distinct from `UNMAPPED` on the **token** rail, which specifically means a
+> role with no `team` tag — see
+> [Why `UNMAPPED` can show up](#why-unmapped-can-show-up-as-a-team). Both are
+> expected, not errors.
+
 ### Where CUR lives, and what access this stack needs
 
 Before the setup steps, here is the whole data-flow and permission picture in

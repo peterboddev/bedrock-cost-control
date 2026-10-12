@@ -601,8 +601,16 @@ rm -f cdk-outputs.json web/.env
 - **The CUR clock is AWS-side.** The ~1-2 day wait in Parts 1 and 7 is billing
   propagation + export delivery, not something the stack or this runbook can
   speed up.
-- **Terminology.** `UNMAPPED` (token pipeline) and `UNTAGGED` (cost Lambda) both
-  mean "usage from a role with no `team` tag" — expected, not an error.
+- **`UNMAPPED` vs `UNTAGGED` — not the same thing.**
+  - `UNMAPPED` (token pipeline) is usage from a role that has **no `team` tag**.
+  - `UNTAGGED` (cost / CUR Billed Cost sheet) is Bedrock cost with **no
+    `iamPrincipal/team` value in the CUR**, which happens for either reason:
+    (a) the calling role had no `team` tag, **or** (b) the usage was billed
+    *before* you activated the tag — cost-allocation tags are **not
+    retroactive**, so all pre-activation spend is `UNTAGGED` even if the role
+    carried a `team` tag at the time. On a fresh account this is the usual
+    cause: your historical Bedrock spend stays `UNTAGGED`, and only usage billed
+    after activation attributes to a team. Both are expected, not errors.
 
 For the architecture, the full IAM least-privilege breakdown, the reconcile
 sweep for mapping existing roles to teams, the Mantle endpoint, and design
