@@ -222,6 +222,30 @@ aws lambda invoke --function-name "$ADMIN_FN" --cli-binary-format raw-in-base64-
 # -> {"ok":true,"data":[{"modelId":"amazon.nova-lite-v1:0","endpoint":"bedrock-runtime",...}]}
 ```
 
+### Mantle models (`bedrock-mantle`)
+
+Mantle is a **co-equal endpoint, not an add-on** — allow the Mantle models your
+teams use the same way, with `endpoint:"bedrock-mantle"`. Mantle ids are always
+`regional` (no cross-region/global inference profiles). List what Mantle offers
+in your region, then allow one:
+
+```bash
+# What Mantle serves here (its OpenAI-compatible /v1/models surface):
+aws lambda invoke --function-name "$ADMIN_FN" --cli-binary-format raw-in-base64-out \
+  --payload "{\"operation\":\"listModelCatalog\",\"payload\":{\"endpoint\":\"bedrock-mantle\",\"region\":\"$AWS_REGION\"}}" \
+  out.json && cat out.json
+
+# Allow one (use an id from the catalog above):
+aws lambda invoke --function-name "$ADMIN_FN" --cli-binary-format raw-in-base64-out \
+  --payload "{\"operation\":\"putModelRegistryEntry\",\"payload\":{\"modelId\":\"openai.gpt-oss-120b\",\"endpoint\":\"bedrock-mantle\",\"provider\":\"openai\",\"scope\":\"regional\",\"region\":\"$AWS_REGION\"}}" \
+  out.json && cat out.json   # -> {"ok":true}
+```
+
+A model may be allowed on **both** endpoints — they are independent allow-list
+entries keyed by `(modelId, endpoint, region)`, and one budget (Part 4) covers
+both. Allowing a Mantle model is only step 1 for Mantle; finish it in **Part
+5c**, which maps that usage to teams and makes enforcement and cost work.
+
 ---
 
 ## Part 4 — Set per-team daily token quotas (cost control)
@@ -339,6 +363,77 @@ aws lambda invoke --function-name "$ADMIN_FN" --cli-binary-format raw-in-base64-
   --payload '{"operation":"removeDenyPolicy","payload":{"team":"alpha","model":"amazon.nova-lite-v1:0"}}' \
   out.json && cat out.json
 ```
+
+### 5c. Cover the Mantle endpoint (`bedrock-mantle`)
+
+Parts 5a/5b are the **Converse** half. **Mantle is the other half of this
+product** — skip it and half your Bedrock spend goes untracked and unenforced.
+Mantle has no per-request identity log, so its two rails use two different keys:
+
+- **Token usage + enforcement** → the **Team↔Project mapping** (the `Project`
+  dimension on `AWS/BedrockMantle` CloudWatch metrics), *not* the role tag.
+- **Billed dollars** → the `team` tag on the IAM role whose **bearer token**
+  authorized the call (CUR `iamPrincipal/team`).
+
+Full per-team Mantle coverage therefore needs **both** of the steps below (see
+[How a budget maps to Converse vs Mantle](./README.md#how-a-budget-maps-to-converse-vs-mantle)).
+
+**1. Allow a Mantle model** — the "Mantle models" block in
+[Part 3](#part-3--allow-the-models-teams-may-use). The collector ignores Mantle
+until at least one `bedrock-mantle` model is on the allow-list.
+
+**2. Map each Mantle Project to a team.** This stack has **no project-discovery
+API** — read your project ids from the metrics your Mantle traffic emits, then
+map each one:
+
+```bash
+# Project ids that have emitted Mantle metrics (the dimension the collector reads):
+aws cloudwatch list-metrics --namespace AWS/BedrockMantle --region "$AWS_REGION" \
+  --query "Metrics[].Dimensions[?Name=='Project'].Value" --output text | tr '\t' '\n' | sort -u
+
+# Map one to a team (repeat per project):
+aws lambda invoke --function-name "$ADMIN_FN" --cli-binary-format raw-in-base64-out \
+  --payload '{"operation":"putTeamProjectMapping","payload":{"projectId":"<project-id>","team":"alpha"}}' \
+  out.json && cat out.json   # -> {"ok":true}
+```
+
+Usage for a Mantle project with **no** mapping is bucketed under team `UNMAPPED`
+(never dropped), so that team's budget never sees it and enforcement never fires.
+
+**3. Make the Mantle-calling roles enforceable and cost-attributed.** The roles
+your apps use to call Mantle must (a) carry the `team` tag — so **CUR attributes
+the dollars** — and (b) be known to enforcement. A `team`-tagged role is cached
+for enforcement automatically the instant it is tagged; pre-existing roles can
+be added with `reconcileTeamRoles` or `mapRoleToTeam`
+(`{"roleArn":"...","team":"..."}`). **This step is more load-bearing for Mantle
+than Converse**: Mantle has no per-request log to auto-cache a role "on use," so
+a Mantle breach for a team whose roles aren't cached records the block and sends
+a notification but attaches **no deny policy**.
+
+**4. Drive Mantle traffic.** Mantle inference is an OpenAI-compatible HTTPS call
+to `https://bedrock-mantle.<region>.api.aws` authorized by a short-lived Bedrock
+bearer token (minted e.g. with `@aws/bedrock-token-generator`) from a
+`team`-tagged role. There is **no `aws` CLI verb** for Mantle inference, so point
+an existing Mantle client at a model you allowed in step 1 using credentials
+from a team-tagged role — in production this is just your normal app traffic.
+
+**Confirm attribution** (after the collector's next 15-min run):
+
+```bash
+aws dynamodb scan --table-name Usage_Aggregation --region "$AWS_REGION" \
+  --filter-expression "#e = :m" \
+  --expression-attribute-names '{"#e":"endpoint"}' \
+  --expression-attribute-values '{":m":{"S":"bedrock-mantle"}}' \
+  --projection-expression "PK,SK,inputTokens,outputTokens" --output json
+# -> rows like PK="TEAM#alpha#MODEL#openai.gpt-oss-120b". PK="TEAM#UNMAPPED#..."
+#    means that project id is not mapped yet (step 2).
+```
+
+**Enforcement** uses the same endpoint-agnostic budget (Part 4), but a Mantle
+breach attaches a `bedrock-mantle-quota-deny-*` inline policy denying
+`bedrock-mantle:CreateInference` for that one model (vs `bedrock-quota-deny-*` /
+`bedrock:InvokeModel` on Converse). A model allowed on both endpoints keeps one
+budget but gets two independent deny policies.
 
 ---
 
@@ -543,6 +638,14 @@ spend appears under `UNTAGGED`); the team dashboard shows each viewer's own
 team(s). Token counts on this sheet come from the bill (CUR reports usage in
 `1K tokens`, which the Lambda converts to absolute counts).
 
+> **Mantle dollars attribute the same way, with one wrinkle.** CUR groups by
+> `iamPrincipal/team`, and for Mantle AWS bills the role whose **bearer token**
+> authorized the call — so Mantle spend lands per team only when your apps mint
+> those tokens from `team`-tagged roles (otherwise `UNTAGGED`, even though the
+> Team↔Project mapping still attributes the *tokens*). Mantle-served Claude bills
+> under `AmazonBedrockService`, already included in the query above. Both
+> endpoints share this ~1-2 day CUR delay.
+
 ---
 
 ## Part 8 — Full verification checklist
@@ -557,6 +660,8 @@ team(s). Token counts on this sheet come from the bill (CUR reports usage in
 | 6 | Token dashboards render | admin + team dashboards (Part 6) |
 | 7 | CUR has team values | Athena query returns team names (Part 7c) |
 | 8 | Dollar dashboards render | Billed Cost sheet (Part 7d) |
+| 9 | Mantle model allowed + project mapped | `listModelRegistry` (a `bedrock-mantle` entry) + `listTeamProjectMappings` (Part 5c) |
+| 10 | Mantle usage attributed per team | `Usage_Aggregation` rows with `endpoint=bedrock-mantle` (Part 5c) |
 
 ---
 
@@ -615,7 +720,10 @@ rm -f cdk-outputs.json web/.env
   propagation + export delivery, not something the stack or this runbook can
   speed up.
 - **`UNMAPPED` vs `UNTAGGED` — not the same thing.**
-  - `UNMAPPED` (token pipeline) is usage from a role that has **no `team` tag**.
+  - `UNMAPPED` (token pipeline) is usage this system could not attribute to a
+    team: on **Converse**, a call from a role with **no `team` tag**; on
+    **Mantle**, usage from a `Project` with **no Team↔Project mapping** (Part
+    5c). Either way it is bucketed under `UNMAPPED`, never dropped.
   - `UNTAGGED` (cost / CUR Billed Cost sheet) is Bedrock cost with **no
     `iamPrincipal/team` value in the CUR**, which happens for either reason:
     (a) the calling role had no `team` tag, **or** (b) the usage was billed
@@ -624,6 +732,12 @@ rm -f cdk-outputs.json web/.env
     carried a `team` tag at the time. On a fresh account this is the usual
     cause: your historical Bedrock spend stays `UNTAGGED`, and only usage billed
     after activation attributes to a team. Both are expected, not errors.
+- **Mantle enforcement needs the team's roles cached.** Mantle has no
+  per-request log, so a Mantle breach only attaches deny policies to roles
+  already in the role cache (tagged, reconciled, or `mapRoleToTeam`'d). A
+  Mantle-only team with no cached roles gets the block recorded and a
+  notification sent, but nothing is actually denied until a role is cached.
+  (Converse auto-caches a role the first time it is used.)
 
 For the architecture, the full IAM least-privilege breakdown, the reconcile
 sweep for mapping existing roles to teams, the Mantle endpoint, and design
