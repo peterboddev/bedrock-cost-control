@@ -734,12 +734,38 @@ deny policy).
 | Where token counts come from | Model Invocation Logging → S3 (per-request `inputTokenCount`/`outputTokenCount`) | `AWS/BedrockMantle` CloudWatch metrics (`TotalInputTokens`/`TotalOutputTokens`, dimensioned by `Project`/`ModelId`) |
 | How usage is attributed to a team | the `team` tag on the calling IAM role | the **Team↔Project mapping** (Mantle has no per-request identity log), so each Mantle `Project` must be mapped to a team via the `putTeamProjectMapping` admin op |
 | How a breach is enforced | inline IAM **deny** on `bedrock:InvokeModel`/Converse actions for that model's ARN | inline IAM **deny** on the Mantle inference action, scoped to that model |
+| How billed **$** attributes (CUR cost dashboard) | the role's `team` tag → CUR `tags['iamPrincipal/team']`, automatic once the tag is activated | billed to the IAM role whose **bearer token** authorized the call — mint that token from a `team`-tagged role so cost carries `iamPrincipal/team`, else it lands as `UNTAGGED` |
 
 Practical implication for the UI: for a **Mantle** model, usage only shows up
 (and enforcement only works) once the model's `Project` is mapped to the team
 — otherwise its CloudWatch metrics can't be attributed to anyone. Setting a
 budget alone is not enough for Mantle. For **Converse** models, the role's
 `team` tag is sufficient; no mapping step is needed.
+
+#### Attributing **dollars** on each endpoint (and why Mantle differs)
+
+Tokens and dollars attribute by *different* keys, and the dollar key behaves
+differently per endpoint. The CUR cost dashboard groups by the
+`iamPrincipal/team` cost-allocation tag — the `team` tag of the IAM principal
+**AWS billed** for the call:
+
+- **Converse (`bedrock-runtime`)**: the billed principal *is* the role making
+  the `InvokeModel`/`Converse` call, so tagging that role with `team` is
+  enough. The same tag drives both usage attribution and cost. Nothing extra.
+- **Mantle (`bedrock-mantle`)**: calls are authorized by a short-lived,
+  IAM-derived **bearer token** (`@aws/bedrock-token-generator`), so AWS bills
+  the role the token was **minted from**. Mint Mantle bearer tokens from a
+  `team`-tagged role and the cost attributes to that team; mint them from an
+  untagged principal (or a shared/service identity) and the spend shows up as
+  **`UNTAGGED`** in the cost dashboard — even though the Team↔Project mapping
+  still attributes the *tokens* correctly.
+
+So Mantle can need **two** independent things for a complete per-team picture:
+the **Team↔Project mapping** (so token usage and enforcement attribute to the
+team) *and* **team-tagged bearer-token minting** (so the billed dollars
+attribute to the team). Converse needs only the role's `team` tag for both.
+Note the two rails also differ in latency: token usage is near-real-time, while
+CUR dollars lag actual spend by ~1-2 days on both endpoints.
 
 ### Seeding / backfilling the team list
 
@@ -1071,12 +1097,17 @@ exactly, so cost reporting reads CUR directly.
 
 > **Why some cost shows up as `UNTAGGED` (and how it differs from `UNMAPPED`).**
 > The Billed Cost view groups by the `iamPrincipal/team` tag in CUR. A line item
-> has **no** team value — bucketed as `UNTAGGED` — for either of two reasons:
+> has **no** team value — bucketed as `UNTAGGED` — for a few reasons:
 > (a) the calling role had no `team` tag, **or** (b) the usage was billed
 > *before* the tag was activated. **Cost-allocation tags are not retroactive**,
 > so all pre-activation Bedrock spend stays `UNTAGGED` even if the role carried a
 > `team` tag at the time — on a fresh install your entire history is `UNTAGGED`,
-> and only usage billed *after* activation attributes to a team. (The line
+> and only usage billed *after* activation attributes to a team. **(c)** A
+> **Mantle** call is `UNTAGGED` when its IAM-derived bearer token was minted
+> from an untagged principal — Mantle bills the token's role, so mint it from a
+> `team`-tagged role (see
+> [Attributing dollars on each endpoint](#attributing-dollars-on-each-endpoint-and-why-mantle-differs)).
+> (The line
 > item still records the caller in `line_item_iam_principal`, so you can group
 > historical spend by principal even when the team tag is absent.) This is
 > distinct from `UNMAPPED` on the **token** rail, which specifically means a
