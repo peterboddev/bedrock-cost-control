@@ -243,10 +243,25 @@ than silently unenforced.
   no `Blocked_State` (previously `REMOVE_DENY_FAILED` → `PENDING_RESET`).
 - Converse enforcement re-verified unchanged (block + restore).
 
-**Not yet exercised live:** the full ">15-minute wait, then drive a real Mantle
-breach over quota and watch the deny attach" end-to-end. The durable-cache write
-(the root cause) is confirmed, so the attach loop now has a role to iterate; the
-timed breach is left as a follow-up smoke test rather than a blocker.
+**Exercised live — full timed end-to-end (PASS).** On 2026-10-13 the complete
+">15-minute wait, then a real Mantle breach" path was run against `us-east-2`:
+- `mapRoleToTeam` warmed `SampleTeamRole-alpha` durably at **13:04:39Z** (cache
+  entry written with no `ttl`); the baseline block was cleared and the quota
+  raised so nothing would breach during the wait.
+- The entry was re-checked at 13:13Z and 13:22Z — still present, still no `ttl`,
+  i.e. past **13:19:39Z**, the instant the old 15-min TTL would have expired. At
+  13:22Z `listTeamRoleMappings` (the same `TeamIndex` GSI the enforcer's
+  `listRolesForTeam` queries) still returned the role.
+- The quota was then lowered to 500 and the **real** Mantle usage collector was
+  re-invoked; it re-pulled the day's live `AWS/BedrockMantle` metrics (the real
+  1,960 tokens) and rewrote Usage_Aggregation, firing the enforcer stream.
+- Result at **13:23:05Z** (~18.5 min after warming): the enforcer attached
+  `bedrock-mantle-quota-deny-…` (`Deny bedrock-mantle:CreateInference`,
+  `Condition bedrock-mantle:Model = openai.gpt-oss-120b`), wrote a `BLOCKED`
+  Blocked_State, and logged a fresh `ATTACH_DENY` audit entry — the exact case
+  that silently no-oped before the fix. The block was then removed to restore a
+  clean state (a final idempotent `removeDenyPolicy` on a genuinely-attached
+  policy, which also re-confirmed Finding C).
 
 **Regression:** `cdk diff` after the change touched only the affected Lambdas.
 
