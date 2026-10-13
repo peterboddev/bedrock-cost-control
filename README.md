@@ -1095,6 +1095,28 @@ There is deliberately **no rate card** and no `tokens × rate` estimation. A
 derived estimate would only ever approximate a number CUR already provides
 exactly, so cost reporting reads CUR directly.
 
+> **Reconciling to the bill** (per AWS's
+> [Understanding your Bedrock CUR data](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-mgmt-understanding-cur-data.html)).
+> Amazon Bedrock emits a separate CUR line item for **four** token types —
+> input, output, **cache-read**, and **cache-write** — and encodes the service
+> tier (standard/priority/flex) and cross-region routing in the
+> `line_item_usage_type`, each at its own unit price. AWS warns that summing
+> only input + output undercounts the bill. This system reads **actual billed
+> cost** and sums **every** matching Bedrock line item per
+> `(team, model, endpoint)` (via `curUsageTypeParser`), so cache and tiered
+> usage are included and the per-team dollars reconcile to the invoice.
+> *Caveat:* the parser recognizes the usage-type patterns AWS documents today;
+> a brand-new pattern it doesn't yet match is skipped until the parser is
+> updated, which would under-report that slice until then.
+>
+> **CUR has no per-request line items.** Per the same AWS reference, neither
+> classic CUR nor CUR 2.0 carries a per-`requestId` row — both aggregate by
+> usage type over the hour/day. That is exactly why this system keeps a
+> separate, near-real-time **token** rail (Model Invocation Logging for
+> Converse, `AWS/BedrockMantle` metrics for Mantle) for enforcement, and uses
+> CUR only for authoritative, after-the-fact **dollars**. To tie a dollar back
+> to a prompt, join the logs to CUR at the model + usage-type grain.
+
 > **Why some cost shows up as `UNTAGGED` (and how it differs from `UNMAPPED`).**
 > The Billed Cost view groups by the `iamPrincipal/team` tag in CUR. A line item
 > has **no** team value — bucketed as `UNTAGGED` — for a few reasons:

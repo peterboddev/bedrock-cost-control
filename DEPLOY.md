@@ -606,7 +606,10 @@ aws athena get-query-results --region "$AWS_REGION" --query-execution-id "$QID" 
 
 > **Why two product codes.** Bedrock bills under both `AmazonBedrock` (Nova,
 > Llama, gpt-oss, ...) and `AmazonBedrockService` (Anthropic Claude). On a real
-> account Claude is often ~99% of the dollars, so both are required.
+> account Claude is often ~99% of the dollars, so both are required. (AWS's CUR
+> reference documents usage-type patterns and token types but does not enumerate
+> product codes — this split is from inspecting a live export, so re-check it if
+> your account shows Bedrock cost under a different `line_item_product_code`.)
 
 ### 7d. Redeploy pointed at the CUR table
 
@@ -637,6 +640,14 @@ The admin dashboard's Billed Cost sheet shows every team (untagged pre-activatio
 spend appears under `UNTAGGED`); the team dashboard shows each viewer's own
 team(s). Token counts on this sheet come from the bill (CUR reports usage in
 `1K tokens`, which the Lambda converts to absolute counts).
+
+> **What's summed.** Bedrock bills a separate CUR line item per token type —
+> input, output, **cache-read**, and **cache-write** — plus distinct usage
+> types for service tier (standard/priority/flex) and cross-region routing. The
+> cost Lambda sums **all** of them per `(team, model, endpoint)`, so the dollars
+> reconcile to the invoice; AWS notes that counting only input + output
+> undercounts. See
+> [Understanding your Bedrock CUR data](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-mgmt-understanding-cur-data.html).
 
 > **Mantle dollars attribute the same way, with one wrinkle.** CUR groups by
 > `iamPrincipal/team`, and for Mantle AWS bills the role whose **bearer token**

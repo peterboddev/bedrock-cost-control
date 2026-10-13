@@ -35,6 +35,19 @@ The runbook itself is accurate A–Z. The teardown also confirmed Part 9's note
 that the Athena workgroup must be emptied before `cdk destroy` (it fails on a
 non-empty workgroup).
 
+**Scope note.** All three findings below are on the **token / enforcement**
+rail (CloudWatch `AWS/BedrockMantle` metrics → `Usage_Aggregation` → IAM deny).
+The separate **dollar** rail — CUR 2.0 billed cost attributed by
+`iamPrincipal/team` — is unaffected and already reconciles to AWS's CUR
+semantics (four token types, tiered/cross-region usage types, Mantle's
+`{region}-{model}-mantle-{token-type}-standard` form; see the README cost
+section and
+[AWS's CUR reference](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-mgmt-understanding-cur-data.html)).
+For Mantle specifically, CUR bills the IAM role whose bearer token authorized
+the call, so dollars attribute per team as long as that role carries the `team`
+tag — independent of the cache-TTL gap in Finding B, which only affects
+enforcement.
+
 ### Already fixed — Finding A: Mantle usage collection was silently broken
 
 **Committed as `b44ec2f`.** The Mantle usage collector queried CloudWatch
