@@ -408,7 +408,10 @@ be added with `reconcileTeamRoles` or `mapRoleToTeam`
 (`{"roleArn":"...","team":"..."}`). **This step is more load-bearing for Mantle
 than Converse**: Mantle has no per-request log to auto-cache a role "on use," so
 a Mantle breach for a team whose roles aren't cached records the block and sends
-a notification but attaches **no deny policy**.
+a notification but attaches **no deny policy**. Once a role is registered, that
+mapping is **durable — it does not expire**, so you don't need to re-run this to
+keep Mantle enforcement working (a verified, timed end-to-end run is recorded in
+[MANTLE_ENFORCEMENT_PROPOSAL.md](./MANTLE_ENFORCEMENT_PROPOSAL.md)).
 
 **4. Drive Mantle traffic.** Mantle inference is an OpenAI-compatible HTTPS call
 to `https://bedrock-mantle.<region>.api.aws` authorized by a short-lived Bedrock

@@ -826,10 +826,20 @@ attach the deny policy to the right roles when a budget is exceeded. That
 role→team mapping lives in the `Team_Role_Cache` table and is populated
 **automatically** in two ways, with no operator action:
 
-- **On use:** when a role makes a Bedrock call, `Usage_Collector` resolves
-  that role's `team` tag and caches the mapping.
+- **On use (Converse only):** when a role makes a **Converse** call,
+  `Usage_Collector` reads that role's `team` tag from the per-request
+  invocation log and caches the mapping. Mantle emits **no** per-request log,
+  so this path never fires for a Mantle-only role — register those by tag
+  (below), a reconcile, or `mapRoleToTeam`.
 - **On tag:** a CloudTrail `TagRole` event warms the cache the instant a role
   is tagged with a `team` value.
+
+Once written, these mappings are **durable — they do not expire.** That is what
+makes Mantle enforcement reliable: because nothing re-caches a Mantle-only role
+"on use," the mapping has to persist on its own so a breach keeps attaching deny
+policies for as long as the role stays mapped — not just for a window after you
+tag or map it. (A role's tag changing directly in IAM is corrected by a re-tag
+event or an Option A reconcile, below — not by expiry.)
 
 For the common case you never touch this. The budget UI's **"Team → IAM role
 mapping"** panel exists only for two edge cases:
