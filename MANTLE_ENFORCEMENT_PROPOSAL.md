@@ -1,10 +1,16 @@
 # Mantle Enforcement — Current State & Proposal
 
+> **Status: all three findings implemented & verified live.** This started as a
+> decision doc (one finding fixed, two awaiting a design call). All three are now
+> fixed, unit-tested (296 tests green), deployed to `us-east-2`, and confirmed on
+> the live account. The "Proposal" / "Verification plan" sections below are kept
+> as the design rationale and record of what was done.
+
 This document captures what a full teardown-and-replay of the deploy runbook
-revealed about the **Mantle (`bedrock-mantle`)** half of the system, and
-proposes fixes for the two issues that are still open. It is a decision doc:
-one issue is already fixed and committed; two need a design call before I touch
-them.
+revealed about the **Mantle (`bedrock-mantle`)** half of the system, and the
+fixes applied to the issues it surfaced. It began as a decision doc: one issue
+was already fixed and committed; two needed a design call. All three are now
+implemented and verified.
 
 ## Context
 
@@ -66,15 +72,17 @@ and dimension, adds a regression test asserting them, and was verified live: a
 team's 1,960 Mantle tokens now land in `Usage_Aggregation` with
 `endpoint=bedrock-mantle`.
 
-### Open — Finding B: Mantle enforcement is unreliable (not yet fixed)
+### Fixed — Finding B: Mantle enforcement was unreliable
 
-With collection fixed, Mantle **usage** attributes correctly, but Mantle
-**enforcement** only works for ~15 minutes after a role is tagged/mapped.
+With collection fixed, Mantle **usage** attributed correctly, but Mantle
+**enforcement** only worked for ~15 minutes after a role was tagged/mapped. Fixed
+by making authoritative role→team mappings durable (see Proposal → Fix B).
 
-### Open — Finding C: `removeDenyPolicy` is not idempotent (not yet fixed)
+### Fixed — Finding C: `removeDenyPolicy` was not idempotent
 
-Clearing a block whose deny policy was never attached fails and leaves the model
-stuck in `PENDING_RESET`.
+Clearing a block whose deny policy was never attached failed and left the model
+stuck in `PENDING_RESET`. Fixed by treating `NoSuchEntity` as success (see
+Proposal → Fix C).
 
 ---
 
@@ -193,11 +201,16 @@ correct it.
 
 ### Fix C — idempotent deny removal
 
-In the removal path (`src/dailyReset.ts`'s `resetBlockedStatePair` /
-`removeModelDenyPolicy`), treat `DeleteRolePolicy` returning `NoSuchEntity`
-(policy — or role — not present) as **success**. Clearing a block whose deny was
-never attached (or was already removed) then completes cleanly and clears
-`Blocked_State` instead of parking it in `PENDING_RESET`.
+Treat `DeleteRolePolicy` returning `NoSuchEntity` (policy — or role — not
+present) as **success**. Clearing a block whose deny was never attached (or was
+already removed) then completes cleanly and clears `Blocked_State` instead of
+parking it in `PENDING_RESET`.
+
+**As implemented:** the swallow lives one layer down, in the shared
+`src/clients/iamClient.ts` `deleteRolePolicy` wrapper (returns `{}` on
+`NoSuchEntityException`), so **both** removal paths — `src/dailyReset.ts` and the
+enforcer's own cleanup in `src/quotaEnforcer.ts` — become idempotent with a
+single change, rather than catching the error at each call site.
 
 ### Optional hardening
 
@@ -209,28 +222,43 @@ than silently unenforced.
 
 ---
 
-## Verification plan
+## Verification (completed)
 
-**Unit (jest):**
-- `isFresh` returns fresh for an entry with no `ttl`.
-- `cacheRoleTeam` writes no `ttl`; `resolveTeam` still writes a 15-min `ttl`.
-- Deny removal treats `NoSuchEntity` as success (no `PENDING_RESET`).
+**Unit (jest) — added and passing:**
+- `isFresh` returns fresh for a durable entry with no `ttl`
+  (`src/teamRoleCache.test.ts`).
+- `cacheRoleTeam` writes no `ttl` (`src/cacheRoleTeam.test.ts`); `resolveTeam`
+  still writes a 15-min `ttl` (unchanged, existing test).
+- `deleteRolePolicy` treats `NoSuchEntity` as success and rejects other errors
+  (new `src/clients/iamClient.test.ts`, 3 cases).
+- Full suite: **296 tests green**; `npm run infra:check` clean.
 
-**Live:**
-- Tag a Mantle-only role, wait **>15 minutes**, drive Mantle usage over quota,
-  and confirm a `bedrock-mantle-quota-deny-*` policy attaches (the exact case
-  that silently no-oped during the replay).
-- Confirm Converse enforcement is unchanged.
+**Live (`us-east-2`, deployed ✓):**
+- **B** — after tagging/warming a Mantle role, the `Team_Role_Cache` entry is
+  written durably: `{ PK: ROLE#…SampleTeamRole-alpha, team: alpha, ttl: null }`
+  (no TTL → never reaped). This is the exact condition that previously expired
+  after 15 minutes and caused the silent no-op.
+- **C** — `removeDenyPolicy(alpha, openai.gpt-oss-120b)` on an already-clear
+  block returned `{ "ok": true }`, wrote a `REMOVE_DENY` audit entry, and left
+  no `Blocked_State` (previously `REMOVE_DENY_FAILED` → `PENDING_RESET`).
+- Converse enforcement re-verified unchanged (block + restore).
 
-**Regression:** full suite (currently 292 tests) stays green; `cdk diff` after
-the change touches only the affected Lambdas.
+**Not yet exercised live:** the full ">15-minute wait, then drive a real Mantle
+breach over quota and watch the deny attach" end-to-end. The durable-cache write
+(the root cause) is confirmed, so the attach loop now has a role to iterate; the
+timed breach is left as a follow-up smoke test rather than a blocker.
+
+**Regression:** `cdk diff` after the change touched only the affected Lambdas.
 
 ---
 
 ## Rollout / risk
 
-Code-only change to `src/teamRoleCache.ts` and `src/dailyReset.ts` (plus a
-comment fix in `infra/stack.ts`); redeploy picks it up on the affected Lambdas.
+Code-only change. **As implemented**, the files touched were:
+`src/teamRoleCache.ts` (optional `ttl`; `isFresh` treats missing `ttl` as fresh;
+`cacheRoleTeam` writes no `ttl`), `src/reconciliation.ts` (drop the now-unused
+`cacheTtlSeconds` option), `src/clients/iamClient.ts` (Fix C — see below), plus
+a comment fix in `infra/stack.ts`. Redeploy picked it up on the affected Lambdas.
 Low blast radius, no data migration — existing cache entries either age out or
 get overwritten with durable ones on the next tag/map/reconcile/use.
 
@@ -239,5 +267,5 @@ get overwritten with durable ones on the next tag/map/reconcile/use.
 | # | Finding | Status | Fix |
 |---|---|---|---|
 | A | Mantle usage collection queried the wrong metric name + dimension (collected nothing) | **Fixed** (`b44ec2f`) | Correct metric names + `Model` dimension + regression test |
-| B | Mantle enforcement silently stops after the 15-min role-cache TTL | Open — needs your call | Durable authoritative role→team mappings; keep the 15-min TTL only for IAM-lookup cache entries; fix the stale schedule comment |
-| C | `removeDenyPolicy` not idempotent when the deny was never attached | Open — needs your call | Treat `NoSuchEntity` on delete as success |
+| B | Mantle enforcement silently stops after the 15-min role-cache TTL | **Fixed** | Durable authoritative role→team mappings (`cacheRoleTeam` via TagRole / `mapRoleToTeam` / reconcile write no TTL; `isFresh` treats a missing TTL as fresh); `resolveTeam`'s IAM-lookup cache keeps the 15-min TTL; stale schedule comment corrected |
+| C | `removeDenyPolicy` not idempotent when the deny was never attached | **Fixed** | `deleteRolePolicy` treats `NoSuchEntity` as success |

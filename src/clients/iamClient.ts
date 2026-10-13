@@ -62,7 +62,21 @@ export async function putRolePolicy(
 export async function deleteRolePolicy(
   input: DeleteRolePolicyCommandInput
 ): Promise<DeleteRolePolicyCommandOutput> {
-  return getIamClient().send(new DeleteRolePolicyCommand(input));
+  try {
+    return await getIamClient().send(new DeleteRolePolicyCommand(input));
+  } catch (error) {
+    // Idempotent delete: an inline deny policy that is already absent (or whose
+    // role is gone) is the desired end state for every caller here (Daily_Reset,
+    // the admin `removeDenyPolicy` override, and the enforcer's
+    // remove-on-config-change). Treating `NoSuchEntity` as success stops a
+    // never-attached or already-removed policy from failing the reset and
+    // stranding Blocked_State in PENDING_RESET. See
+    // MANTLE_ENFORCEMENT_PROPOSAL.md Finding C.
+    if ((error as { name?: string } | undefined)?.name === "NoSuchEntityException") {
+      return {} as DeleteRolePolicyCommandOutput;
+    }
+    throw error;
+  }
 }
 
 export async function listRoles(

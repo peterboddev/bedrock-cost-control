@@ -141,6 +141,32 @@ describe('resolveTeam', () => {
     expect(mockedPutItem).not.toHaveBeenCalled();
   });
 
+  it('treats a durable cache entry (no ttl) as a fresh hit without calling IAM', async () => {
+    // Authoritative mappings written by cacheRoleTeam (TagRole / mapRoleToTeam /
+    // reconcile) carry no ttl and must never be treated as expired, so a role
+    // that only calls Mantle stays resolvable/enforceable indefinitely.
+    const now = new Date('2025-01-15T12:00:00.000Z');
+    mockedGetItem.mockResolvedValue({
+      Item: {
+        PK: `ROLE#${ROLE_ARN}`,
+        team: 'teamMantle',
+        cachedAt: '2025-01-15T09:00:00.000Z',
+        // no ttl
+      },
+    });
+
+    const result = await resolveTeam(ROLE_ARN, {
+      teamTagKey: TEAM_TAG_KEY,
+      tableName: TABLE_NAME,
+      now: () => now,
+    });
+
+    expect(result).toBe('teamMantle');
+    expect(mockedGetRole).not.toHaveBeenCalled();
+    expect(mockedListRoleTags).not.toHaveBeenCalled();
+    expect(mockedPutItem).not.toHaveBeenCalled();
+  });
+
   it('falls back to IAM and caches the result on a cache miss', async () => {
     const now = new Date('2025-01-15T12:00:00.000Z');
     mockedGetItem.mockResolvedValue({ Item: undefined });

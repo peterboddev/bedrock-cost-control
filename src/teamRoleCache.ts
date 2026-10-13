@@ -61,7 +61,15 @@ interface TeamRoleCacheItem {
   PK: string;
   team: Team;
   cachedAt: string;
-  ttl: number;
+  /**
+   * Expiry (epoch seconds) for `resolveTeam`'s IAM-lookup cache entries.
+   * **Omitted for authoritative mappings** written by `cacheRoleTeam`
+   * (TagRole warming / `mapRoleToTeam` / reconcile): those are durable facts,
+   * not a throttling cache, and must not expire — Mantle enforcement has no
+   * per-request path to re-warm an expired entry. See
+   * MANTLE_ENFORCEMENT_PROPOSAL.md Finding B.
+   */
+  ttl?: number;
   /**
    * Constant partition value for the `RoleListIndex` GSI. Every cached item
    * carries this on a dedicated attribute so that all role→team mappings live
@@ -94,6 +102,11 @@ function extractRoleArnFromPartitionKey(partitionKey: string): string {
 }
 
 function isFresh(item: TeamRoleCacheItem, now: Date): boolean {
+  // Authoritative mappings carry no `ttl` and never expire (durable); only
+  // `resolveTeam`'s IAM-lookup entries have a `ttl` and age out for freshness.
+  if (item.ttl === undefined) {
+    return true;
+  }
   const nowEpochSeconds = Math.floor(now.getTime() / 1000);
   return item.ttl > nowEpochSeconds;
 }
@@ -193,8 +206,6 @@ export async function resolveTeamFromIam(roleArn: string, teamTagKey: string): P
 export interface CacheRoleTeamOptions {
   /** Name of the DynamoDB table backing the Team_Role_Cache. */
   tableName: string;
-  /** Cache TTL in seconds; defaults to 15 minutes. */
-  cacheTtlSeconds?: number;
   /** Injectable clock, primarily for tests. */
   now?: () => Date;
 }
@@ -214,12 +225,17 @@ export async function cacheRoleTeam(
   options: CacheRoleTeamOptions
 ): Promise<void> {
   const now = (options.now ?? (() => new Date()))();
-  const ttlSeconds = options.cacheTtlSeconds ?? DEFAULT_CACHE_TTL_SECONDS;
   const item: TeamRoleCacheItem = {
     PK: buildPartitionKey(roleArn),
     team,
     cachedAt: now.toISOString(),
-    ttl: Math.floor(now.getTime() / 1000) + ttlSeconds,
+    // Deliberately NO `ttl`: this is an authoritative mapping, so it must
+    // persist for enforcement. A TTL here would silently disable Mantle
+    // enforcement ~15 min after a role is tagged/mapped (Mantle has no
+    // per-request path to re-warm the cache). Tag changes are corrected by a
+    // fresh TagRole event (re-tag) or the on-demand reconcile sweep (which
+    // deletes the entry when a role's `team` tag is removed). See
+    // MANTLE_ENFORCEMENT_PROPOSAL.md Finding B.
     roleListPk: ROLE_LIST_PARTITION,
   };
   await putItem({ TableName: options.tableName, Item: item });

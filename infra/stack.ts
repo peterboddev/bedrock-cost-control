@@ -13,7 +13,7 @@
  *  - Usage_Collector Lambda   (S3 ObjectCreated event source)
  *  - Quota_Enforcer Lambda    (Usage_Aggregation DynamoDB Streams + TagRole/UntagRole EventBridge rule)
  *  - Daily_Reset Lambda       (00:00 UTC scheduled EventBridge rule)
- *  - Reconciliation Lambda    (15-minute scheduled EventBridge rule)
+ *  - Reconciliation            (ON-DEMAND SQS fan-out: Admin API starter -> ReconcileQueue -> ReconcileWorker; no schedule)
  *  - Admin API Lambda         (adminApi.ts handlers; no trigger wired here - callable via SDK/future API Gateway)
  *  - Notification_Channel SNS topic
  *

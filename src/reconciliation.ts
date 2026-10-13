@@ -37,8 +37,6 @@ export interface ReconcileTeamRoleCacheOptions {
   teamTagKey: string;
   /** Name of the DynamoDB table backing the Team_Role_Cache. */
   teamRoleCacheTableName: string;
-  /** Cache TTL in seconds to apply when upserting each re-resolved entry; defaults to teamRoleCache's own default (15 minutes) when omitted. */
-  cacheTtlSeconds?: number;
   /** Injectable clock, primarily for tests. */
   now?: () => Date;
   /** Retry options forwarded to `resolveTeam`'s IAM calls for each role. */
@@ -157,11 +155,11 @@ export async function reconcileTeamRoleCache(
               tableName: options.teamRoleCacheTableName,
             });
           } else {
-            // Role has a `team` tag: upsert the mapping with a fresh TTL. This
-            // corrects drift when a tag was added or changed directly in IAM.
+            // Role has a `team` tag: upsert the durable mapping. This corrects
+            // drift when a tag was added or changed directly in IAM, and the
+            // entry persists (no TTL) so enforcement can always resolve it.
             await cacheRoleTeam(roleArn, team, {
               tableName: options.teamRoleCacheTableName,
-              cacheTtlSeconds: options.cacheTtlSeconds,
               now: options.now,
             });
           }

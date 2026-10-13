@@ -12,7 +12,7 @@ const mockedPutItem = dynamoDbClient.putItem as jest.Mock;
 beforeEach(() => mockedPutItem.mockReset());
 
 describe('cacheRoleTeam', () => {
-  it('upserts a ROLE#<arn> -> team entry with a future TTL (no IAM call)', async () => {
+  it('upserts a ROLE#<arn> -> team entry as a durable mapping (no TTL, no IAM call)', async () => {
     mockedPutItem.mockResolvedValue({});
     const now = new Date('2025-01-15T12:00:00.000Z');
 
@@ -26,7 +26,9 @@ describe('cacheRoleTeam', () => {
     expect(arg.TableName).toBe('TeamRoleCache');
     expect(arg.Item.PK).toBe('ROLE#arn:aws:iam::123456789012:role/R');
     expect(arg.Item.team).toBe('teamA');
-    // Default 15-minute TTL ahead of now.
-    expect(arg.Item.ttl).toBe(Math.floor(now.getTime() / 1000) + 15 * 60);
+    // Authoritative mapping is durable: no TTL, so DynamoDB never reaps it and
+    // enforcement can always resolve the team's roles — including Mantle-only
+    // roles that have no per-request path to re-warm the cache.
+    expect(arg.Item.ttl).toBeUndefined();
   });
 });
