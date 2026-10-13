@@ -2,7 +2,7 @@
  * Thin AWS SDK v3 wrapper around the CloudWatch (metrics) client.
  *
  * Used by the Mantle usage collector to pull `AWS/BedrockMantle` metrics
- * (`TotalInputTokens`/`TotalOutputTokens` by `Project`+`ModelId`) via
+ * (`InputTokens`/`OutputTokens` by `Project`+`Model`) via
  * `GetMetricData`. Centralizing construction here keeps the collector pure
  * and lets tests inject a fake.
  */

@@ -10,8 +10,16 @@ import { MantleMetricPoint } from './mantleUsageCollector';
 import { UsageDay } from './types';
 
 export const MANTLE_NAMESPACE = 'AWS/BedrockMantle';
-export const METRIC_TOTAL_INPUT_TOKENS = 'TotalInputTokens';
-export const METRIC_TOTAL_OUTPUT_TOKENS = 'TotalOutputTokens';
+// Per-(Project, Model) token metrics. IMPORTANT: AWS/BedrockMantle exposes the
+// combined Project+Model granularity only on `InputTokens`/`OutputTokens` with
+// a `Model` dimension — NOT on the `TotalInputTokens`/`TotalOutputTokens`
+// variants (which exist only at [], [Project], or [Model] granularity), and NOT
+// under a `ModelId` dimension. Querying the wrong metric name or dimension
+// returns zero datapoints, so the collector silently records nothing. Verified
+// against a live AWS/BedrockMantle export during an end-to-end replay.
+export const METRIC_INPUT_TOKENS = 'InputTokens';
+export const METRIC_OUTPUT_TOKENS = 'OutputTokens';
+export const MANTLE_MODEL_DIMENSION = 'Model';
 
 const DAY_SECONDS = 24 * 60 * 60;
 
@@ -65,13 +73,13 @@ export function buildMantleMetricQueries(
 
     const dimensions = [
       { Name: 'Project', Value: spec.projectId },
-      { Name: 'ModelId', Value: spec.modelId },
+      { Name: MANTLE_MODEL_DIMENSION, Value: spec.modelId },
     ];
 
     queries.push({
       Id: inputId,
       MetricStat: {
-        Metric: { Namespace: MANTLE_NAMESPACE, MetricName: METRIC_TOTAL_INPUT_TOKENS, Dimensions: dimensions },
+        Metric: { Namespace: MANTLE_NAMESPACE, MetricName: METRIC_INPUT_TOKENS, Dimensions: dimensions },
         Period: DAY_SECONDS,
         Stat: 'Sum',
       },
@@ -80,7 +88,7 @@ export function buildMantleMetricQueries(
     queries.push({
       Id: outputId,
       MetricStat: {
-        Metric: { Namespace: MANTLE_NAMESPACE, MetricName: METRIC_TOTAL_OUTPUT_TOKENS, Dimensions: dimensions },
+        Metric: { Namespace: MANTLE_NAMESPACE, MetricName: METRIC_OUTPUT_TOKENS, Dimensions: dimensions },
         Period: DAY_SECONDS,
         Stat: 'Sum',
       },
