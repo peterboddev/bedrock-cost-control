@@ -96,6 +96,18 @@ export async function handler(): Promise<void> {
   const bucketName = requiredEnv(ENV_VAR_NAMES.ANALYTICS_EXPORT_BUCKET_NAME);
   const teamTagKey = optionalEnv(ENV_VAR_NAMES.CUR_TEAM_TAG_KEY) ?? 'team';
 
+  // Ensure the latest-partition view the billed-cost dashboards read exists
+  // (idempotent CREATE OR REPLACE VIEW). The QuickSight billed-cost datasets
+  // read this view as a plain relational table so that row-level security is
+  // applied — a QuickSight custom-SQL dataset does NOT get RLS applied, which
+  // is why the per-team Billed Cost sheet previously leaked every team's rows.
+  // No-op on older deploys where the DDL env var is unset.
+  const viewSql = optionalEnv(ENV_VAR_NAMES.CUR_TEAM_COST_LATEST_VIEW_SQL);
+  if (viewSql) {
+    await executeAthenaQuery(viewSql, { workGroup, timeoutSeconds: 60 });
+    console.log('Ensured cur_team_cost_latest view exists (CREATE OR REPLACE VIEW).');
+  }
+
   const curTable = `${curDatabase}.${curTableName}`;
   const now = new Date();
   const billingPeriod = billingPeriodForDate(now);

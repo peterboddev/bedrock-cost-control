@@ -1711,6 +1711,21 @@ export class BedrockTeamTokenQuotaStack extends Stack {
       // analytics bucket under cur-team-cost/ for QuickSight. This is the only
       // source of dollar-denominated cost in the system — the token pipeline
       // handles enforcement, CUR handles cost.
+      // The billed-cost QuickSight datasets read this latest-partition VIEW as
+      // a relational table (NOT QuickSight custom SQL) so that row-level
+      // security is applied to the per-team Billed Cost sheet — a custom-SQL
+      // dataset does not get RLS applied. The CUR cost Lambda (re)creates the
+      // view on every run via this DDL. The view does the month-to-date dedup
+      // (CUR writes MTD totals into every day's partition, so it reads only the
+      // latest partition).
+      const curTeamCostLatestViewSql =
+        "CREATE OR REPLACE VIEW bedrock_team_token_quota.cur_team_cost_latest AS " +
+        "SELECT team, model, endpoint, billedcost, totaltokens, currency, billingperiod " +
+        "FROM bedrock_team_token_quota.cur_team_cost " +
+        "WHERE dt >= date_format(date_add('day', -14, current_date), '%Y-%m-%d') " +
+        "AND dt = (SELECT max(dt) FROM bedrock_team_token_quota.cur_team_cost " +
+        "WHERE team IS NOT NULL AND dt >= date_format(date_add('day', -14, current_date), '%Y-%m-%d'))";
+
       const curTeamCostFunction = new NodejsFunction(this, "CurTeamCostFunction", {
         ...commonFunctionProps,
         entry: path.join(entryDir, "curTeamCostEntry.ts"),
@@ -1722,6 +1737,7 @@ export class BedrockTeamTokenQuotaStack extends Stack {
           [ENV_VAR_NAMES.CUR_ATHENA_WORKGROUP]: athenaWorkGroup.name,
           [ENV_VAR_NAMES.ANALYTICS_EXPORT_BUCKET_NAME]: analyticsBucket.bucketName,
           [ENV_VAR_NAMES.CUR_TEAM_TAG_KEY]: teamTagKey,
+          [ENV_VAR_NAMES.CUR_TEAM_COST_LATEST_VIEW_SQL]: curTeamCostLatestViewSql,
         },
       });
       // Athena: start/get/results queries (no resource-level scoping for Athena).
@@ -1747,6 +1763,30 @@ export class BedrockTeamTokenQuotaStack extends Stack {
             `arn:${this.partition}:glue:${this.region}:${this.account}:catalog`,
             `arn:${this.partition}:glue:${this.region}:${this.account}:database/${props.curDatabaseName}`,
             `arn:${this.partition}:glue:${this.region}:${this.account}:table/${props.curDatabaseName}/${props.curTableName}`,
+          ],
+        })
+      );
+      // Glue: (re)create the `cur_team_cost_latest` VIEW in the analytics
+      // database. Creating/replacing an Athena view is a Glue table write, so
+      // the Lambda needs create/update/delete on this database's tables
+      // (scoped to the analytics DB), plus read to resolve the referenced
+      // `cur_team_cost` table's columns.
+      curTeamCostFunction.addToRolePolicy(
+        new PolicyStatement({
+          sid: "ManageCurTeamCostLatestView",
+          effect: Effect.ALLOW,
+          actions: [
+            "glue:GetDatabase",
+            "glue:GetTable",
+            "glue:GetTables",
+            "glue:CreateTable",
+            "glue:UpdateTable",
+            "glue:DeleteTable",
+          ],
+          resources: [
+            `arn:${this.partition}:glue:${this.region}:${this.account}:catalog`,
+            `arn:${this.partition}:glue:${this.region}:${this.account}:database/bedrock_team_token_quota`,
+            `arn:${this.partition}:glue:${this.region}:${this.account}:table/bedrock_team_token_quota/*`,
           ],
         })
       );
@@ -1967,21 +2007,15 @@ export class BedrockTeamTokenQuotaStack extends Stack {
       // -----------------------------------------------------------------
       // Billed-cost datasets (only when the CUR integration is enabled).
       //
-      // The CUR Lambda writes MONTH-TO-DATE totals into every day's
-      // cur-team-cost/dt=<day>/ partition, so summing across partitions would
-      // double-count. These datasets therefore read only the LATEST partition
-      // that actually has rows. The inner query references a data column
-      // (team) so Athena scans real data instead of answering max(dt) from
-      // partition-projection metadata (which always returns today), and it is
-      // bounded to the last 14 days to avoid listing every projected day.
-      // The dashboard therefore shows the current billing period.
+      // These read the `cur_team_cost_latest` VIEW (created/refreshed by the
+      // CUR cost Lambda) as a plain relational table. Reading a relational
+      // source — rather than QuickSight custom SQL — is what lets QuickSight
+      // apply row-level security to the per-team Billed Cost sheet; a
+      // custom-SQL dataset does NOT get RLS applied (that bug let every team's
+      // billed rows show on the team dashboard). The view encapsulates the
+      // month-to-date dedup (CUR writes MTD totals into every day's partition,
+      // so the view reads only the latest partition).
       // -----------------------------------------------------------------
-      const costSql =
-        "SELECT team, model, endpoint, billedcost, totaltokens, currency, billingperiod " +
-        "FROM bedrock_team_token_quota.cur_team_cost " +
-        "WHERE dt >= date_format(date_add('day', -14, current_date), '%Y-%m-%d') " +
-        "AND dt = (SELECT max(dt) FROM bedrock_team_token_quota.cur_team_cost " +
-        "WHERE team IS NOT NULL AND dt >= date_format(date_add('day', -14, current_date), '%Y-%m-%d'))";
       const costColumns = [
         { name: "team", type: "STRING" },
         { name: "model", type: "STRING" },
@@ -2004,11 +2038,12 @@ export class BedrockTeamTokenQuotaStack extends Stack {
           importMode: "DIRECT_QUERY",
           physicalTableMap: {
             billedCost: {
-              customSql: {
+              relationalTable: {
                 dataSourceArn: dataSource.attrArn,
-                name: "billed_cost_latest",
-                sqlQuery: costSql,
-                columns: costColumns,
+                catalog: "AwsDataCatalog",
+                schema: "bedrock_team_token_quota",
+                name: "cur_team_cost_latest",
+                inputColumns: costColumns,
               },
             },
           },

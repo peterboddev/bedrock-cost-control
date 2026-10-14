@@ -33,6 +33,12 @@ export const ENV_VAR_NAMES = {
   CUR_TABLE_NAME: 'CUR_TABLE_NAME',
   CUR_ATHENA_WORKGROUP: 'CUR_ATHENA_WORKGROUP',
   CUR_TEAM_TAG_KEY: 'CUR_TEAM_TAG_KEY',
+  // DDL the CUR cost Lambda runs each invocation to (re)create the
+  // latest-partition view the billed-cost QuickSight datasets read. The view
+  // is a plain relational source so QuickSight applies row-level security to
+  // it (a custom-SQL dataset does not get RLS applied). See
+  // MANTLE_ENFORCEMENT_PROPOSAL.md / the billed-cost RLS note.
+  CUR_TEAM_COST_LATEST_VIEW_SQL: 'CUR_TEAM_COST_LATEST_VIEW_SQL',
 } as const;
 
 /**
